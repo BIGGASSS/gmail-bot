@@ -1,0 +1,34 @@
+[project]
+name = "gmail-telegram-bot"
+version = "0.1.0"
+description = "Telegram bot that forwards new Gmail messages for whitelisted users."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "aiogram>=3.21.0",
+    "aiosqlite>=0.21.0",
+    "fastapi>=0.116.0",
+    "httpx>=0.28.0",
+    "python-dotenv>=1.1.0",
+    "uvicorn>=0.35.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.4.0",
+    "pytest-asyncio>=1.2.0",
+]
+
+[project.scripts]
+gmail-bot = "gmail_bot.main:run"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gmail_bot"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
