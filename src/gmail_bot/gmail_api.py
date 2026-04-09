@@ -9,7 +9,7 @@ from typing import Any
 import httpx
 
 from gmail_bot.db import Database
-from gmail_bot.formatting import strip_html
+from gmail_bot.formatting import html_to_telegram_text, normalize_gmail_snippet
 from gmail_bot.models import AttachmentMeta, ExpandedMail, GoogleAccount, IncomingMail
 from gmail_bot.oauth import GoogleOAuthClient
 
@@ -141,7 +141,7 @@ class GmailService:
             gmail_message_id=payload["id"],
             from_header=self._header_value(headers, "From") or "Unknown sender",
             subject=self._header_value(headers, "Subject") or "(no subject)",
-            snippet=payload.get("snippet", "") or "(no preview available)",
+            snippet=normalize_gmail_snippet(payload.get("snippet", "")) or "(no preview available)",
             received_at=self._internal_date_to_datetime(payload.get("internalDate")),
         )
 
@@ -274,7 +274,7 @@ class GmailService:
             if mime_type == "text/plain" and data:
                 plain_parts.append(self._decode_body_data(data))
             elif mime_type == "text/html" and data:
-                html_parts.append(strip_html(self._decode_body_data(data)))
+                html_parts.append(html_to_telegram_text(self._decode_body_data(data)))
 
             for child in part.get("parts", []) or []:
                 visit(child)

@@ -49,13 +49,6 @@ cp .env.example .env
 uv run gmail-bot
 ```
 
-## Docker
-
-```bash
-docker build -t gmail-telegram-bot .
-docker run --env-file .env -p 8080:8080 gmail-telegram-bot
-```
-
 ## Telegram commands
 
 - `/start`

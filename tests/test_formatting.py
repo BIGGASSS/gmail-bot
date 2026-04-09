@@ -3,7 +3,14 @@ from __future__ import annotations
 import base64
 from datetime import UTC, datetime
 
-from gmail_bot.formatting import chunk_text, format_expanded_mail, strip_html
+from gmail_bot.formatting import (
+    chunk_text,
+    format_expanded_mail,
+    html_to_telegram_text,
+    normalize_gmail_snippet,
+    render_telegram_html,
+    strip_html,
+)
 from gmail_bot.gmail_api import GmailService
 from gmail_bot.models import AttachmentMeta, ExpandedMail
 
@@ -14,6 +21,29 @@ def encode_body(value: str) -> str:
 
 def test_strip_html_collapses_markup() -> None:
     assert strip_html("<p>Hello <strong>world</strong></p>") == "Hello world"
+
+
+def test_strip_html_preserves_link_targets() -> None:
+    assert strip_html('<p><a href="https://example.com/deal">Join Pro now</a></p>') == "Join Pro now <https://example.com/deal>"
+
+
+def test_normalize_gmail_snippet_unescapes_entities() -> None:
+    assert normalize_gmail_snippet("Don&#39;t miss out") == "Don't miss out"
+
+
+def test_render_telegram_html_linkifies_urls() -> None:
+    rendered = render_telegram_html("Join Pro now\n<https://example.com/deal?plan=pro&discount=50>")
+    assert 'href="https://example.com/deal?plan=pro&amp;discount=50"' in rendered
+    assert ">https://example.com/deal?plan=pro&amp;discount=50<" in rendered
+
+
+def test_render_telegram_html_preserves_anchor_text() -> None:
+    rendered = render_telegram_html(
+        html_to_telegram_text('<p><a href="https://example.com/deal?plan=pro&discount=50">Join Pro now</a></p>')
+    )
+    assert 'href="https://example.com/deal?plan=pro&amp;discount=50"' in rendered
+    assert ">Join Pro now<" in rendered
+    assert "https://example.com/deal?plan=pro&amp;discount=50</a>" not in rendered
 
 
 def test_chunk_text_splits_long_messages() -> None:
@@ -60,4 +90,22 @@ def test_extract_body_and_attachments_prefers_plain_text() -> None:
     )
     assert body == "Plain body"
     assert attachments[0].filename == "report.pdf"
+
+
+def test_extract_body_and_attachments_keeps_html_anchor_text_clickable() -> None:
+    service = GmailService(http_client=None, oauth_client=None, database=None)  # type: ignore[arg-type]
+    body, attachments = service._extract_body_and_attachments(  # noqa: SLF001
+        {
+            "mimeType": "text/html",
+            "body": {
+                "data": encode_body(
+                    '<p><a href="https://example.com/deal?plan=pro&discount=50">Join Pro now</a></p>'
+                )
+            },
+        }
+    )
+    rendered = render_telegram_html(body)
+    assert not attachments
+    assert 'href="https://example.com/deal?plan=pro&amp;discount=50"' in rendered
+    assert ">Join Pro now<" in rendered
 

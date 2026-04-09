@@ -13,7 +13,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 
 from gmail_bot.config import Settings
 from gmail_bot.db import Database, utcnow
-from gmail_bot.formatting import chunk_text, format_expanded_mail, format_mail_notification
+from gmail_bot.formatting import chunk_text, format_expanded_mail, format_mail_notification, render_telegram_html
 from gmail_bot.gmail_api import GmailAPIError, GmailHistoryExpiredError, GmailService
 from gmail_bot.models import ExpandedMail, IncomingMail
 from gmail_bot.oauth import GoogleOAuthClient, OAuthError
@@ -46,7 +46,7 @@ class TelegramNotifier:
 
     async def send_text(self, chat_id: int, text: str) -> None:
         for chunk in chunk_text(text):
-            await self._bot.send_message(chat_id, chunk)
+            await self._bot.send_message(chat_id, render_telegram_html(chunk), parse_mode="HTML")
 
     async def send_login_success(self, chat_id: int, gmail_email: str) -> None:
         await self.send_text(
@@ -63,11 +63,16 @@ class TelegramNotifier:
                 [InlineKeyboardButton(text="Expand", callback_data=f"{EXPAND_PREFIX}{mail.gmail_message_id}")]
             ]
         )
-        return await self._bot.send_message(chat_id, format_mail_notification(mail), reply_markup=keyboard)
+        return await self._bot.send_message(
+            chat_id,
+            render_telegram_html(format_mail_notification(mail)),
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
 
     async def send_expanded_mail(self, chat_id: int, mail: ExpandedMail) -> None:
         for chunk in chunk_text(format_expanded_mail(mail)):
-            await self._bot.send_message(chat_id, chunk)
+            await self._bot.send_message(chat_id, render_telegram_html(chunk), parse_mode="HTML")
 
 
 def build_dispatcher(
@@ -130,14 +135,17 @@ def build_dispatcher(
         )
         url = oauth_client.build_authorization_url(state=state)
         await message.answer(
-            "\n".join(
-                [
-                    "Open this link to connect Gmail:",
-                    url,
-                    "",
-                    "The login link expires in 15 minutes.",
-                ]
-            )
+            render_telegram_html(
+                "\n".join(
+                    [
+                        "Open this link to connect Gmail:",
+                        url,
+                        "",
+                        "The login link expires in 15 minutes.",
+                    ]
+                )
+            ),
+            parse_mode="HTML",
         )
 
     @router.message(Command("status"))
