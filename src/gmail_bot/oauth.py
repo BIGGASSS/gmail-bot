@@ -25,6 +25,23 @@ class TokenResponse:
 class OAuthError(RuntimeError):
     """Raised when OAuth operations fail."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        error: str | None = None,
+        error_description: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.error = error
+        self.error_description = error_description
+
+    @property
+    def is_invalid_grant(self) -> bool:
+        return self.error == "invalid_grant"
+
 
 class GoogleOAuthClient:
     def __init__(self, settings: Settings, http_client: httpx.AsyncClient) -> None:
@@ -87,8 +104,18 @@ class GoogleOAuthClient:
 
     async def _decode_json_response(self, response: httpx.Response) -> dict:
         if response.status_code >= 400:
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = None
+
             message = response.text.strip() or response.reason_phrase
-            raise OAuthError(f"Google OAuth request failed: {response.status_code} {message}")
+            raise OAuthError(
+                f"Google OAuth request failed: {response.status_code} {message}",
+                status_code=response.status_code,
+                error=payload.get("error") if isinstance(payload, dict) else None,
+                error_description=payload.get("error_description") if isinstance(payload, dict) else None,
+            )
         payload = response.json()
         if "access_token" not in payload:
             raise OAuthError("Google OAuth response did not include an access token.")

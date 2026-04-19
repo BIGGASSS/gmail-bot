@@ -15,7 +15,7 @@ from gmail_bot.config import Settings
 from gmail_bot.db import Database, utcnow
 from gmail_bot.formatting import chunk_text, format_expanded_mail, format_mail_notification, render_telegram_html
 from gmail_bot.gmail_api import GmailAPIError, GmailHistoryExpiredError, GmailService
-from gmail_bot.models import ExpandedMail, IncomingMail
+from gmail_bot.models import ExpandedMail, GoogleAccount, IncomingMail
 from gmail_bot.oauth import GoogleOAuthClient, OAuthError
 
 
@@ -56,6 +56,18 @@ class TelegramNotifier:
 
     async def send_login_failure(self, chat_id: int, error: str) -> None:
         await self.send_text(chat_id, f"Gmail login failed: {error}")
+
+    async def send_relogin_required(self, chat_id: int, gmail_email: str) -> None:
+        await self.send_text(
+            chat_id,
+            "\n".join(
+                [
+                    f"Gmail connection expired or was revoked: {gmail_email}",
+                    "The saved Google authorization is no longer valid, so automatic mail forwarding has stopped.",
+                    "Use /login to connect Gmail again.",
+                ]
+            ),
+        )
 
     async def send_mail_notification(self, chat_id: int, mail: IncomingMail) -> Message:
         keyboard = InlineKeyboardMarkup(
@@ -243,11 +255,16 @@ class GmailPoller:
                     await self._process_account(account)
                 except TelegramForbiddenError:
                     logger.warning("Telegram user %s blocked the bot.", account.telegram_user_id)
-                except (GmailAPIError, TelegramAPIError, OAuthError):
+                except OAuthError as exc:
+                    if exc.is_invalid_grant:
+                        await self._handle_invalid_grant(account, exc)
+                    else:
+                        logger.exception("Failed while polling Gmail for Telegram user %s.", account.telegram_user_id)
+                except (GmailAPIError, TelegramAPIError):
                     logger.exception("Failed while polling Gmail for Telegram user %s.", account.telegram_user_id)
             await asyncio.sleep(self._settings.gmail_poll_interval_seconds)
 
-    async def _process_account(self, account) -> None:
+    async def _process_account(self, account: GoogleAccount) -> None:
         try:
             new_messages, latest_history_id = await self._gmail_service.list_new_inbox_messages(account)
         except GmailHistoryExpiredError as exc:
@@ -276,3 +293,23 @@ class GmailPoller:
                 telegram_chat_id=telegram_message.chat.id,
                 telegram_message_id=telegram_message.message_id,
             )
+
+    async def _handle_invalid_grant(self, account: GoogleAccount, exc: OAuthError) -> None:
+        logger.warning(
+            "Google authorization expired or was revoked for Telegram user %s (%s): %s",
+            account.telegram_user_id,
+            account.gmail_email,
+            exc,
+        )
+        try:
+            await self._notifier.send_relogin_required(account.telegram_user_id, account.gmail_email)
+        except TelegramForbiddenError:
+            logger.warning("Telegram user %s blocked the bot.", account.telegram_user_id)
+        except TelegramAPIError:
+            logger.exception(
+                "Failed to notify Telegram user %s about expired Gmail authorization.",
+                account.telegram_user_id,
+            )
+
+        await self._database.delete_google_account(account.telegram_user_id)
+        logger.info("Disconnected Gmail account for Telegram user %s after invalid_grant.", account.telegram_user_id)
