@@ -24,6 +24,24 @@ logger = logging.getLogger(__name__)
 EXPAND_PREFIX = "expand:"
 
 
+def build_expand_callback_data(gmail_message_id: str, page_index: int = 0) -> str:
+    if page_index == 0:
+        return f"{EXPAND_PREFIX}{gmail_message_id}"
+    return f"{EXPAND_PREFIX}{gmail_message_id}:{page_index}"
+
+
+def parse_expand_callback_data(callback_data: str) -> tuple[str, int]:
+    value = callback_data.removeprefix(EXPAND_PREFIX)
+    gmail_message_id, separator, page = value.rpartition(":")
+    if not separator:
+        return value, 0
+
+    try:
+        return gmail_message_id, int(page)
+    except ValueError:
+        return value, 0
+
+
 class WhitelistMiddleware(BaseMiddleware):
     def __init__(self, authorized_user_ids: frozenset[int]) -> None:
         self._authorized_user_ids = authorized_user_ids
@@ -72,7 +90,7 @@ class TelegramNotifier:
     async def send_mail_notification(self, chat_id: int, mail: IncomingMail) -> Message:
         keyboard = InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(text="Expand", callback_data=f"{EXPAND_PREFIX}{mail.gmail_message_id}")]
+                [InlineKeyboardButton(text="Expand", callback_data=build_expand_callback_data(mail.gmail_message_id))]
             ]
         )
         return await self._bot.send_message(
@@ -86,17 +104,32 @@ class TelegramNotifier:
         for chunk in chunk_text(format_expanded_mail(mail)):
             await self._bot.send_message(chat_id, render_telegram_html(chunk), parse_mode="HTML")
 
-    async def edit_expanded_mail(self, message: Message, mail: ExpandedMail) -> None:
+    async def edit_expanded_mail(self, message: Message, mail: ExpandedMail, *, page_index: int = 0) -> None:
         chunks = chunk_text(format_expanded_mail(mail))
-        first_chunk, remaining_chunks = chunks[0], chunks[1:]
+        page_index = max(0, min(page_index, len(chunks) - 1))
+        keyboard = self._build_expanded_page_keyboard(mail.gmail_message_id, len(chunks))
 
         await message.edit_text(
-            render_telegram_html(first_chunk),
+            render_telegram_html(chunks[page_index]),
             parse_mode="HTML",
-            reply_markup=None,
+            reply_markup=keyboard,
         )
-        for chunk in remaining_chunks:
-            await self._bot.send_message(message.chat.id, render_telegram_html(chunk), parse_mode="HTML")
+
+    def _build_expanded_page_keyboard(self, gmail_message_id: str, page_count: int) -> InlineKeyboardMarkup | None:
+        if page_count <= 1:
+            return None
+
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text=str(page_number),
+                        callback_data=build_expand_callback_data(gmail_message_id, page_number - 1),
+                    )
+                    for page_number in range(1, page_count + 1)
+                ]
+            ]
+        )
 
 
 def build_dispatcher(
@@ -215,7 +248,7 @@ def build_dispatcher(
         if callback.from_user is None or callback.data is None:
             return
 
-        gmail_message_id = callback.data.removeprefix(EXPAND_PREFIX)
+        gmail_message_id, page_index = parse_expand_callback_data(callback.data)
         account = await database.get_google_account(callback.from_user.id)
         if account is None:
             await callback.answer("Connect Gmail first.", show_alert=True)
@@ -242,7 +275,7 @@ def build_dispatcher(
             return
 
         try:
-            await notifier.edit_expanded_mail(callback.message, expanded)
+            await notifier.edit_expanded_mail(callback.message, expanded, page_index=page_index)
         except TelegramAPIError:
             logger.exception("Failed to edit Telegram message %s for user %s", callback.message.message_id, callback.from_user.id)
             await callback.answer("Failed to update the message.", show_alert=True)

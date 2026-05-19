@@ -6,7 +6,7 @@ import pytest
 
 from gmail_bot.models import ExpandedMail, GoogleAccount
 from gmail_bot.oauth import OAuthError
-from gmail_bot.telegram_bot import GmailPoller, TelegramNotifier
+from gmail_bot.telegram_bot import GmailPoller, TelegramNotifier, parse_expand_callback_data
 
 
 class DummyDatabase:
@@ -80,7 +80,7 @@ async def test_edit_expanded_mail_edits_original_message_and_removes_button() ->
 
 
 @pytest.mark.asyncio
-async def test_edit_expanded_mail_sends_remaining_chunks_as_continuations() -> None:
+async def test_edit_expanded_mail_adds_page_buttons_for_long_messages() -> None:
     bot = FakeBot()
     notifier = TelegramNotifier(bot)  # type: ignore[arg-type]
     message = FakeMessage()
@@ -96,9 +96,38 @@ async def test_edit_expanded_mail_sends_remaining_chunks_as_continuations() -> N
     await notifier.edit_expanded_mail(message, mail)  # type: ignore[arg-type]
 
     assert len(message.edits) == 1
-    assert bot.sent_messages
-    assert bot.sent_messages[0][0] == 456
-    assert bot.sent_messages[0][2]["parse_mode"] == "HTML"
+    assert bot.sent_messages == []
+    reply_markup = message.edits[0]["reply_markup"]
+    assert reply_markup is not None
+    buttons = reply_markup.inline_keyboard[0]  # type: ignore[union-attr]
+    assert [button.text for button in buttons] == ["1", "2"]
+    assert [button.callback_data for button in buttons] == ["expand:gmail-message-1", "expand:gmail-message-1:1"]
+
+
+@pytest.mark.asyncio
+async def test_edit_expanded_mail_edits_requested_page() -> None:
+    bot = FakeBot()
+    notifier = TelegramNotifier(bot)  # type: ignore[arg-type]
+    message = FakeMessage()
+    mail = ExpandedMail(
+        gmail_message_id="gmail-message-1",
+        from_header="sender@example.com",
+        subject="Long body",
+        received_at=datetime(2024, 1, 2, 3, 4, 5, tzinfo=UTC),
+        body_text="Line\n" * 1000,
+        attachments=(),
+    )
+
+    await notifier.edit_expanded_mail(message, mail, page_index=1)  # type: ignore[arg-type]
+
+    assert len(message.edits) == 1
+    assert "Body:" not in message.edits[0]["text"]
+    assert bot.sent_messages == []
+
+
+def test_parse_expand_callback_data_supports_optional_page() -> None:
+    assert parse_expand_callback_data("expand:gmail-message-1") == ("gmail-message-1", 0)
+    assert parse_expand_callback_data("expand:gmail-message-1:2") == ("gmail-message-1", 2)
 
 
 @pytest.mark.asyncio
