@@ -86,6 +86,18 @@ class TelegramNotifier:
         for chunk in chunk_text(format_expanded_mail(mail)):
             await self._bot.send_message(chat_id, render_telegram_html(chunk), parse_mode="HTML")
 
+    async def edit_expanded_mail(self, message: Message, mail: ExpandedMail) -> None:
+        chunks = chunk_text(format_expanded_mail(mail))
+        first_chunk, remaining_chunks = chunks[0], chunks[1:]
+
+        await message.edit_text(
+            render_telegram_html(first_chunk),
+            parse_mode="HTML",
+            reply_markup=None,
+        )
+        for chunk in remaining_chunks:
+            await self._bot.send_message(message.chat.id, render_telegram_html(chunk), parse_mode="HTML")
+
 
 def build_dispatcher(
     *,
@@ -217,6 +229,10 @@ def build_dispatcher(
             await callback.answer("This message is no longer available.", show_alert=True)
             return
 
+        if not isinstance(callback.message, Message):
+            await callback.answer("Could not edit this message.", show_alert=True)
+            return
+
         try:
             expanded = await gmail_service.get_expanded_message(account, gmail_message_id)
         except GmailAPIError as exc:
@@ -225,8 +241,14 @@ def build_dispatcher(
             await notifier.send_text(callback.from_user.id, f"Could not expand the message: {exc}")
             return
 
-        await callback.answer("Loading full message...")
-        await notifier.send_expanded_mail(callback.from_user.id, expanded)
+        try:
+            await notifier.edit_expanded_mail(callback.message, expanded)
+        except TelegramAPIError:
+            logger.exception("Failed to edit Telegram message %s for user %s", callback.message.message_id, callback.from_user.id)
+            await callback.answer("Failed to update the message.", show_alert=True)
+            return
+
+        await callback.answer()
 
     dispatcher = Dispatcher()
     dispatcher.include_router(router)
