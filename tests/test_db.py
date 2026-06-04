@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from datetime import UTC, timedelta
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from gmail_bot.db import Database, utcnow
+from gmail_bot.models import MANUAL_RELOGIN_PROMPT_DELAY
 
 
 @pytest.mark.asyncio
@@ -53,5 +54,37 @@ async def test_database_tracks_delivered_messages(tmp_path) -> None:
         telegram_user_id=321,
         gmail_message_id="gmail-message-1",
     )
+
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_database_tracks_manual_relogin_prompt_schedule(tmp_path) -> None:
+    database = Database(tmp_path / "bot.db")
+    await database.connect()
+    await database.initialize()
+
+    connected_at = datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC)
+    await database.upsert_google_account(
+        telegram_user_id=654,
+        gmail_email="user@example.com",
+        access_token="access-token",
+        refresh_token="refresh-token",
+        token_expiry=connected_at + timedelta(hours=1),
+        last_history_id="100",
+        connected_at=connected_at,
+    )
+
+    account = await database.get_google_account(654)
+    assert account is not None
+    assert account.relogin_prompt_due_at == connected_at + MANUAL_RELOGIN_PROMPT_DELAY
+    assert account.relogin_prompt_sent_at is None
+
+    sent_at = connected_at + MANUAL_RELOGIN_PROMPT_DELAY + timedelta(minutes=1)
+    await database.mark_relogin_prompt_sent(telegram_user_id=654, sent_at=sent_at)
+
+    account = await database.get_google_account(654)
+    assert account is not None
+    assert account.relogin_prompt_sent_at == sent_at
 
     await database.close()

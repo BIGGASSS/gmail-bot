@@ -72,6 +72,18 @@ class TelegramNotifier:
             f"Gmail account connected: {gmail_email}\nNew inbox messages will appear here automatically.",
         )
 
+    async def send_manual_relogin_prompt(self, chat_id: int, gmail_email: str) -> None:
+        await self.send_text(
+            chat_id,
+            "\n".join(
+                [
+                    f"It has been 6 days since you connected Gmail: {gmail_email}",
+                    "Google may revoke this connection after a week without warning.",
+                    "Please refresh the connection now by sending /logout, then /login.",
+                ]
+            ),
+        )
+
     async def send_login_failure(self, chat_id: int, error: str) -> None:
         await self.send_text(chat_id, f"Gmail login failed: {error}")
 
@@ -215,15 +227,16 @@ def build_dispatcher(
             await message.answer("No Gmail account is connected. Use /login to connect one.")
             return
 
-        await message.answer(
-            "\n".join(
-                [
-                    f"Connected Gmail account: {account.gmail_email}",
-                    f"Polling interval: {settings.gmail_poll_interval_seconds} seconds",
-                    f"Watching for new mail after: {account.connected_at.isoformat()}",
-                ]
+        status_lines = [
+            f"Connected Gmail account: {account.gmail_email}",
+            f"Polling interval: {settings.gmail_poll_interval_seconds} seconds",
+            f"Watching for new mail after: {account.connected_at.isoformat()}",
+        ]
+        if account.relogin_prompt_due_at is not None:
+            status_lines.append(
+                f"Manual reconnect reminder due: {account.relogin_prompt_due_at.isoformat()}"
             )
-        )
+        await message.answer("\n".join(status_lines))
 
     @router.message(Command("logout"))
     async def handle_logout(message: Message) -> None:
@@ -320,6 +333,8 @@ class GmailPoller:
             await asyncio.sleep(self._settings.gmail_poll_interval_seconds)
 
     async def _process_account(self, account: GoogleAccount) -> None:
+        await self._send_manual_relogin_prompt_if_due(account)
+
         try:
             new_messages, latest_history_id = await self._gmail_service.list_new_inbox_messages(account)
         except GmailHistoryExpiredError as exc:
@@ -348,6 +363,28 @@ class GmailPoller:
                 telegram_chat_id=telegram_message.chat.id,
                 telegram_message_id=telegram_message.message_id,
             )
+
+    async def _send_manual_relogin_prompt_if_due(self, account: GoogleAccount) -> None:
+        if account.relogin_prompt_due_at is None or account.relogin_prompt_sent_at is not None:
+            return
+        if account.relogin_prompt_due_at > utcnow():
+            return
+
+        try:
+            await self._notifier.send_manual_relogin_prompt(
+                account.telegram_user_id,
+                account.gmail_email,
+            )
+        except TelegramForbiddenError:
+            raise
+        except TelegramAPIError:
+            logger.exception(
+                "Failed to send manual Gmail reconnect prompt to Telegram user %s.",
+                account.telegram_user_id,
+            )
+            return
+
+        await self._database.mark_relogin_prompt_sent(telegram_user_id=account.telegram_user_id)
 
     async def _handle_invalid_grant(self, account: GoogleAccount, exc: OAuthError) -> None:
         logger.warning(

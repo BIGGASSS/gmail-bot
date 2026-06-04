@@ -4,7 +4,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from gmail_bot.models import ExpandedMail, GoogleAccount
+from gmail_bot.models import MANUAL_RELOGIN_PROMPT_DELAY, ExpandedMail, GoogleAccount
 from gmail_bot.oauth import OAuthError
 from gmail_bot.telegram_bot import GmailPoller, TelegramNotifier, parse_expand_callback_data
 
@@ -12,14 +12,22 @@ from gmail_bot.telegram_bot import GmailPoller, TelegramNotifier, parse_expand_c
 class DummyDatabase:
     def __init__(self) -> None:
         self.deleted_user_ids: list[int] = []
+        self.relogin_prompt_sent_user_ids: list[int] = []
 
     async def delete_google_account(self, telegram_user_id: int) -> None:
         self.deleted_user_ids.append(telegram_user_id)
 
+    async def mark_relogin_prompt_sent(self, *, telegram_user_id: int) -> None:
+        self.relogin_prompt_sent_user_ids.append(telegram_user_id)
+
 
 class DummyNotifier:
     def __init__(self) -> None:
+        self.manual_relogin_prompts: list[tuple[int, str]] = []
         self.relogin_requests: list[tuple[int, str]] = []
+
+    async def send_manual_relogin_prompt(self, chat_id: int, gmail_email: str) -> None:
+        self.manual_relogin_prompts.append((chat_id, gmail_email))
 
     async def send_relogin_required(self, chat_id: int, gmail_email: str) -> None:
         self.relogin_requests.append((chat_id, gmail_email))
@@ -128,6 +136,62 @@ async def test_edit_expanded_mail_edits_requested_page() -> None:
 def test_parse_expand_callback_data_supports_optional_page() -> None:
     assert parse_expand_callback_data("expand:gmail-message-1") == ("gmail-message-1", 0)
     assert parse_expand_callback_data("expand:gmail-message-1:2") == ("gmail-message-1", 2)
+
+
+@pytest.mark.asyncio
+async def test_manual_relogin_prompt_sends_once_when_due() -> None:
+    database = DummyDatabase()
+    notifier = DummyNotifier()
+    poller = GmailPoller(
+        settings=DummySettings(),
+        database=database,  # type: ignore[arg-type]
+        gmail_service=DummyGmailService(),  # type: ignore[arg-type]
+        notifier=notifier,  # type: ignore[arg-type]
+    )
+    connected_at = datetime.now(tz=UTC) - MANUAL_RELOGIN_PROMPT_DELAY
+    account = GoogleAccount(
+        telegram_user_id=123,
+        gmail_email="user@example.com",
+        access_token="access-token",
+        refresh_token="refresh-token",
+        token_expiry=datetime.now(tz=UTC) + timedelta(hours=1),
+        last_history_id="100",
+        connected_at=connected_at,
+        relogin_prompt_due_at=connected_at + MANUAL_RELOGIN_PROMPT_DELAY,
+    )
+
+    await poller._send_manual_relogin_prompt_if_due(account)  # noqa: SLF001
+
+    assert notifier.manual_relogin_prompts == [(123, "user@example.com")]
+    assert database.relogin_prompt_sent_user_ids == [123]
+
+
+@pytest.mark.asyncio
+async def test_manual_relogin_prompt_skips_when_not_due() -> None:
+    database = DummyDatabase()
+    notifier = DummyNotifier()
+    poller = GmailPoller(
+        settings=DummySettings(),
+        database=database,  # type: ignore[arg-type]
+        gmail_service=DummyGmailService(),  # type: ignore[arg-type]
+        notifier=notifier,  # type: ignore[arg-type]
+    )
+    connected_at = datetime.now(tz=UTC)
+    account = GoogleAccount(
+        telegram_user_id=123,
+        gmail_email="user@example.com",
+        access_token="access-token",
+        refresh_token="refresh-token",
+        token_expiry=datetime.now(tz=UTC) + timedelta(hours=1),
+        last_history_id="100",
+        connected_at=connected_at,
+        relogin_prompt_due_at=connected_at + MANUAL_RELOGIN_PROMPT_DELAY,
+    )
+
+    await poller._send_manual_relogin_prompt_if_due(account)  # noqa: SLF001
+
+    assert notifier.manual_relogin_prompts == []
+    assert database.relogin_prompt_sent_user_ids == []
 
 
 @pytest.mark.asyncio

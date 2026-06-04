@@ -8,6 +8,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 from gmail_bot.db import Database, utcnow
 from gmail_bot.gmail_api import GmailService
+from gmail_bot.models import MANUAL_RELOGIN_PROMPT_DELAY
 from gmail_bot.oauth import GoogleOAuthClient, OAuthError
 from gmail_bot.telegram_bot import TelegramNotifier
 
@@ -79,6 +80,7 @@ def create_web_app(
                 token_expiry=token_response.expires_at,
                 last_history_id=profile.history_id,
                 connected_at=connected_at,
+                relogin_prompt_due_at=oauth_state.created_at + MANUAL_RELOGIN_PROMPT_DELAY,
             )
             await notifier.send_login_success(oauth_state.telegram_user_id, profile.email_address)
         except Exception as exc:

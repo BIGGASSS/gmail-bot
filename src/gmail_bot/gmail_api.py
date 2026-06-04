@@ -228,6 +228,8 @@ class GmailService:
             token_expiry=tokens.expires_at,
             last_history_id=account.last_history_id,
             connected_at=account.connected_at,
+            relogin_prompt_due_at=account.relogin_prompt_due_at,
+            relogin_prompt_sent_at=account.relogin_prompt_sent_at,
         )
 
     def _decode_json_response(self, response: httpx.Response) -> dict[str, Any]:

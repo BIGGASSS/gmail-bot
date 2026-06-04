@@ -6,7 +6,7 @@ from typing import Any
 
 import aiosqlite
 
-from gmail_bot.models import GoogleAccount, OAuthState
+from gmail_bot.models import MANUAL_RELOGIN_PROMPT_DELAY, GoogleAccount, OAuthState
 
 
 def utcnow() -> datetime:
@@ -63,6 +63,8 @@ class Database:
                 token_expiry TEXT NOT NULL,
                 last_history_id TEXT NOT NULL,
                 connected_at TEXT NOT NULL,
+                relogin_prompt_due_at TEXT,
+                relogin_prompt_sent_at TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -78,7 +80,50 @@ class Database:
             );
             """
         )
+        await self._ensure_google_account_relogin_prompt_columns()
+        await self._backfill_google_account_relogin_prompt_due_at()
         await self.connection.commit()
+
+    async def _ensure_google_account_relogin_prompt_columns(self) -> None:
+        cursor = await self.connection.execute("PRAGMA table_info(google_accounts)")
+        rows = await cursor.fetchall()
+        await cursor.close()
+        existing_columns = {row["name"] for row in rows}
+
+        if "relogin_prompt_due_at" not in existing_columns:
+            await self.connection.execute(
+                "ALTER TABLE google_accounts ADD COLUMN relogin_prompt_due_at TEXT"
+            )
+        if "relogin_prompt_sent_at" not in existing_columns:
+            await self.connection.execute(
+                "ALTER TABLE google_accounts ADD COLUMN relogin_prompt_sent_at TEXT"
+            )
+
+    async def _backfill_google_account_relogin_prompt_due_at(self) -> None:
+        cursor = await self.connection.execute(
+            """
+            SELECT telegram_user_id, connected_at
+            FROM google_accounts
+            WHERE relogin_prompt_due_at IS NULL
+            """
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+
+        for row in rows:
+            connected_at = from_iso8601(row["connected_at"])
+            await self.connection.execute(
+                """
+                UPDATE google_accounts
+                SET relogin_prompt_due_at = ?, updated_at = ?
+                WHERE telegram_user_id = ?
+                """,
+                (
+                    to_iso8601(connected_at + MANUAL_RELOGIN_PROMPT_DELAY),
+                    to_iso8601(utcnow()),
+                    row["telegram_user_id"],
+                ),
+            )
 
     async def store_oauth_state(
         self,
@@ -136,8 +181,12 @@ class Database:
         token_expiry: datetime,
         last_history_id: str,
         connected_at: datetime,
+        relogin_prompt_due_at: datetime | None = None,
     ) -> None:
         now = to_iso8601(utcnow())
+        relogin_prompt_due_at = relogin_prompt_due_at or (
+            connected_at + MANUAL_RELOGIN_PROMPT_DELAY
+        )
         await self.connection.execute(
             """
             INSERT INTO google_accounts (
@@ -148,10 +197,12 @@ class Database:
                 token_expiry,
                 last_history_id,
                 connected_at,
+                relogin_prompt_due_at,
+                relogin_prompt_sent_at,
                 created_at,
                 updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(telegram_user_id) DO UPDATE SET
                 gmail_email = excluded.gmail_email,
                 access_token = excluded.access_token,
@@ -159,6 +210,8 @@ class Database:
                 token_expiry = excluded.token_expiry,
                 last_history_id = excluded.last_history_id,
                 connected_at = excluded.connected_at,
+                relogin_prompt_due_at = excluded.relogin_prompt_due_at,
+                relogin_prompt_sent_at = excluded.relogin_prompt_sent_at,
                 updated_at = excluded.updated_at
             """,
             (
@@ -169,6 +222,8 @@ class Database:
                 to_iso8601(token_expiry),
                 last_history_id,
                 to_iso8601(connected_at),
+                to_iso8601(relogin_prompt_due_at),
+                None,
                 now,
                 now,
             ),
@@ -178,7 +233,16 @@ class Database:
     async def get_google_account(self, telegram_user_id: int) -> GoogleAccount | None:
         cursor = await self.connection.execute(
             """
-            SELECT telegram_user_id, gmail_email, access_token, refresh_token, token_expiry, last_history_id, connected_at
+            SELECT
+                telegram_user_id,
+                gmail_email,
+                access_token,
+                refresh_token,
+                token_expiry,
+                last_history_id,
+                connected_at,
+                relogin_prompt_due_at,
+                relogin_prompt_sent_at
             FROM google_accounts
             WHERE telegram_user_id = ?
             """,
@@ -191,7 +255,16 @@ class Database:
     async def list_google_accounts(self) -> list[GoogleAccount]:
         cursor = await self.connection.execute(
             """
-            SELECT telegram_user_id, gmail_email, access_token, refresh_token, token_expiry, last_history_id, connected_at
+            SELECT
+                telegram_user_id,
+                gmail_email,
+                access_token,
+                refresh_token,
+                token_expiry,
+                last_history_id,
+                connected_at,
+                relogin_prompt_due_at,
+                relogin_prompt_sent_at
             FROM google_accounts
             ORDER BY telegram_user_id ASC
             """
@@ -247,6 +320,23 @@ class Database:
             WHERE telegram_user_id = ?
             """,
             (last_history_id, to_iso8601(utcnow()), telegram_user_id),
+        )
+        await self.connection.commit()
+
+    async def mark_relogin_prompt_sent(
+        self,
+        *,
+        telegram_user_id: int,
+        sent_at: datetime | None = None,
+    ) -> None:
+        sent_at = sent_at or utcnow()
+        await self.connection.execute(
+            """
+            UPDATE google_accounts
+            SET relogin_prompt_sent_at = ?, updated_at = ?
+            WHERE telegram_user_id = ?
+            """,
+            (to_iso8601(sent_at), to_iso8601(utcnow()), telegram_user_id),
         )
         await self.connection.commit()
 
@@ -308,6 +398,8 @@ class Database:
         )
 
     def _account_from_row(self, row: aiosqlite.Row | dict[str, Any]) -> GoogleAccount:
+        relogin_prompt_due_at = row["relogin_prompt_due_at"]
+        relogin_prompt_sent_at = row["relogin_prompt_sent_at"]
         return GoogleAccount(
             telegram_user_id=row["telegram_user_id"],
             gmail_email=row["gmail_email"],
@@ -316,5 +408,11 @@ class Database:
             token_expiry=from_iso8601(row["token_expiry"]),
             last_history_id=row["last_history_id"],
             connected_at=from_iso8601(row["connected_at"]),
+            relogin_prompt_due_at=(
+                from_iso8601(relogin_prompt_due_at) if relogin_prompt_due_at else None
+            ),
+            relogin_prompt_sent_at=(
+                from_iso8601(relogin_prompt_sent_at) if relogin_prompt_sent_at else None
+            ),
         )
 

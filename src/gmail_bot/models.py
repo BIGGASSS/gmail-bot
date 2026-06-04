@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
+
+
+MANUAL_RELOGIN_PROMPT_DELAY = timedelta(days=6)
 
 
 @dataclass(slots=True, frozen=True)
@@ -21,6 +24,8 @@ class GoogleAccount:
     token_expiry: datetime
     last_history_id: str
     connected_at: datetime
+    relogin_prompt_due_at: datetime | None = None
+    relogin_prompt_sent_at: datetime | None = None
 
 
 @dataclass(slots=True, frozen=True)
