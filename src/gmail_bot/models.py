@@ -4,7 +4,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 
-MANUAL_RELOGIN_PROMPT_DELAY = timedelta(days=6)
+DEFAULT_RELOGIN_PROMPT_DELAY_DAYS = 6
+MANUAL_RELOGIN_PROMPT_DELAY = timedelta(days=DEFAULT_RELOGIN_PROMPT_DELAY_DAYS)
 
 
 @dataclass(slots=True, frozen=True)
@@ -26,6 +27,16 @@ class GoogleAccount:
     connected_at: datetime
     relogin_prompt_due_at: datetime | None = None
     relogin_prompt_sent_at: datetime | None = None
+    relogin_prompt_enabled: bool = True
+    relogin_prompt_delay_days: int = DEFAULT_RELOGIN_PROMPT_DELAY_DAYS
+    relogin_prompt_base_at: datetime | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class ReloginPromptPreferences:
+    telegram_user_id: int
+    relogin_prompt_enabled: bool = True
+    relogin_prompt_delay_days: int = DEFAULT_RELOGIN_PROMPT_DELAY_DAYS
 
 
 @dataclass(slots=True, frozen=True)

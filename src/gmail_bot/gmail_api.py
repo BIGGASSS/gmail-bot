@@ -228,6 +228,9 @@ class GmailService:
             token_expiry=tokens.expires_at,
             last_history_id=account.last_history_id,
             connected_at=account.connected_at,
+            relogin_prompt_enabled=account.relogin_prompt_enabled,
+            relogin_prompt_delay_days=account.relogin_prompt_delay_days,
+            relogin_prompt_base_at=account.relogin_prompt_base_at,
             relogin_prompt_due_at=account.relogin_prompt_due_at,
             relogin_prompt_sent_at=account.relogin_prompt_sent_at,
         )

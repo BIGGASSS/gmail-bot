@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from gmail_bot.db import Database, utcnow
-from gmail_bot.models import MANUAL_RELOGIN_PROMPT_DELAY
+from gmail_bot.models import DEFAULT_RELOGIN_PROMPT_DELAY_DAYS, MANUAL_RELOGIN_PROMPT_DELAY
 
 
 @pytest.mark.asyncio
@@ -77,10 +77,28 @@ async def test_database_tracks_manual_relogin_prompt_schedule(tmp_path) -> None:
 
     account = await database.get_google_account(654)
     assert account is not None
+    assert account.relogin_prompt_enabled is True
+    assert account.relogin_prompt_delay_days == DEFAULT_RELOGIN_PROMPT_DELAY_DAYS
+    assert account.relogin_prompt_base_at == connected_at
     assert account.relogin_prompt_due_at == connected_at + MANUAL_RELOGIN_PROMPT_DELAY
     assert account.relogin_prompt_sent_at is None
 
-    sent_at = connected_at + MANUAL_RELOGIN_PROMPT_DELAY + timedelta(minutes=1)
+    await database.set_relogin_prompt_enabled(telegram_user_id=654, enabled=False)
+    account = await database.get_google_account(654)
+    assert account is not None
+    assert account.relogin_prompt_enabled is False
+    preferences = await database.get_relogin_prompt_preferences(654)
+    assert preferences.relogin_prompt_enabled is False
+
+    await database.set_relogin_prompt_delay_days(telegram_user_id=654, delay_days=3)
+    account = await database.get_google_account(654)
+    assert account is not None
+    assert account.relogin_prompt_delay_days == 3
+    assert account.relogin_prompt_due_at == connected_at + timedelta(days=3)
+    preferences = await database.get_relogin_prompt_preferences(654)
+    assert preferences.relogin_prompt_delay_days == 3
+
+    sent_at = connected_at + timedelta(days=3, minutes=1)
     await database.mark_relogin_prompt_sent(telegram_user_id=654, sent_at=sent_at)
 
     account = await database.get_google_account(654)

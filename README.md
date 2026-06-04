@@ -54,6 +54,7 @@ uv run gmail-bot
 - `/start`
 - `/login`
 - `/status`
+- `/relogin_reminder on|off|days N`
 - `/logout`
 - `/help`
 

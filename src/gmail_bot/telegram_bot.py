@@ -8,7 +8,7 @@ from datetime import timedelta
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.dispatcher.middlewares.base import BaseMiddleware
 from aiogram.exceptions import TelegramAPIError, TelegramForbiddenError
-from aiogram.filters import Command
+from aiogram.filters import Command, CommandObject
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from gmail_bot.config import Settings
@@ -42,6 +42,39 @@ def parse_expand_callback_data(callback_data: str) -> tuple[str, int]:
         return value, 0
 
 
+def parse_relogin_reminder_setting(args: str | None) -> bool | None:
+    value = (args or "").strip().casefold()
+    if value in {"on", "enable", "enabled", "yes", "true", "1"}:
+        return True
+    if value in {"off", "disable", "disabled", "no", "false", "0"}:
+        return False
+    return None
+
+
+def parse_relogin_reminder_delay_days(args: str | None) -> int | None:
+    tokens = (args or "").strip().casefold().split()
+    if not tokens:
+        return None
+
+    candidate: str | None = None
+    if len(tokens) == 1:
+        candidate = tokens[0]
+    elif len(tokens) == 2 and tokens[0] in {"day", "days", "delay", "timer"}:
+        candidate = tokens[1]
+    elif len(tokens) == 2 and tokens[1] in {"day", "days"}:
+        candidate = tokens[0]
+
+    if candidate is None or not candidate.isdecimal():
+        return None
+
+    days = int(candidate)
+    return days if days > 0 else None
+
+
+def format_day_count(days: int) -> str:
+    return f"{days} day" if days == 1 else f"{days} days"
+
+
 class WhitelistMiddleware(BaseMiddleware):
     def __init__(self, authorized_user_ids: frozenset[int]) -> None:
         self._authorized_user_ids = authorized_user_ids
@@ -72,12 +105,17 @@ class TelegramNotifier:
             f"Gmail account connected: {gmail_email}\nNew inbox messages will appear here automatically.",
         )
 
-    async def send_manual_relogin_prompt(self, chat_id: int, gmail_email: str) -> None:
+    async def send_manual_relogin_prompt(
+        self,
+        chat_id: int,
+        gmail_email: str,
+        delay_days: int,
+    ) -> None:
         await self.send_text(
             chat_id,
             "\n".join(
                 [
-                    f"It has been 6 days since you connected Gmail: {gmail_email}",
+                    f"It has been {format_day_count(delay_days)} since you connected Gmail: {gmail_email}",
                     "Google may revoke this connection after a week without warning.",
                     "Please refresh the connection now by sending /logout, then /login.",
                 ]
@@ -184,6 +222,7 @@ def build_dispatcher(
                     "/start - basic status",
                     "/login - connect your Gmail account",
                     "/status - show Gmail connection status",
+                    "/relogin_reminder [on|off|days N] - configure the manual reconnect reminder",
                     "/logout - disconnect Gmail",
                     "/help - show this help",
                 ]
@@ -231,12 +270,64 @@ def build_dispatcher(
             f"Connected Gmail account: {account.gmail_email}",
             f"Polling interval: {settings.gmail_poll_interval_seconds} seconds",
             f"Watching for new mail after: {account.connected_at.isoformat()}",
+            f"Manual reconnect reminder: {'on' if account.relogin_prompt_enabled else 'off'}",
+            f"Manual reconnect timer: {format_day_count(account.relogin_prompt_delay_days)}",
         ]
-        if account.relogin_prompt_due_at is not None:
+        if account.relogin_prompt_enabled and account.relogin_prompt_due_at is not None:
             status_lines.append(
                 f"Manual reconnect reminder due: {account.relogin_prompt_due_at.isoformat()}"
             )
         await message.answer("\n".join(status_lines))
+
+    @router.message(Command("relogin_reminder"))
+    async def handle_relogin_reminder(message: Message, command: CommandObject) -> None:
+        if message.from_user is None:
+            return
+
+        telegram_user_id = message.from_user.id
+        account = await database.get_google_account(telegram_user_id)
+        preferences = await database.get_relogin_prompt_preferences(telegram_user_id)
+
+        delay_days = parse_relogin_reminder_delay_days(command.args)
+        if delay_days is not None:
+            await database.set_relogin_prompt_delay_days(
+                telegram_user_id=telegram_user_id,
+                delay_days=delay_days,
+            )
+            account = await database.get_google_account(telegram_user_id)
+            response_lines = [
+                f"Manual reconnect timer set to {format_day_count(delay_days)}.",
+            ]
+            if account is None:
+                response_lines.append("This will apply to your next Gmail login.")
+            elif account.relogin_prompt_due_at is not None:
+                response_lines.append(
+                    f"Next reminder due: {account.relogin_prompt_due_at.isoformat()}"
+                )
+            await message.answer("\n".join(response_lines))
+            return
+
+        enabled = parse_relogin_reminder_setting(command.args)
+        if enabled is not None:
+            await database.set_relogin_prompt_enabled(
+                telegram_user_id=telegram_user_id,
+                enabled=enabled,
+            )
+            await message.answer(f"Manual reconnect reminder switched {'on' if enabled else 'off'}.")
+            return
+
+        current_enabled = account.relogin_prompt_enabled if account else preferences.relogin_prompt_enabled
+        current_delay_days = (
+            account.relogin_prompt_delay_days if account else preferences.relogin_prompt_delay_days
+        )
+        response_lines = [
+            f"Manual reconnect reminder is currently {'on' if current_enabled else 'off'}.",
+            f"Manual reconnect timer: {format_day_count(current_delay_days)}.",
+            "Use /relogin_reminder on, /relogin_reminder off, or /relogin_reminder days 5.",
+        ]
+        if account is None:
+            response_lines.append("No Gmail account is connected; settings will apply to your next /login.")
+        await message.answer("\n".join(response_lines))
 
     @router.message(Command("logout"))
     async def handle_logout(message: Message) -> None:
@@ -365,6 +456,8 @@ class GmailPoller:
             )
 
     async def _send_manual_relogin_prompt_if_due(self, account: GoogleAccount) -> None:
+        if not account.relogin_prompt_enabled:
+            return
         if account.relogin_prompt_due_at is None or account.relogin_prompt_sent_at is not None:
             return
         if account.relogin_prompt_due_at > utcnow():
@@ -374,6 +467,7 @@ class GmailPoller:
             await self._notifier.send_manual_relogin_prompt(
                 account.telegram_user_id,
                 account.gmail_email,
+                account.relogin_prompt_delay_days,
             )
         except TelegramForbiddenError:
             raise
