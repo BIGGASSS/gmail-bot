@@ -1,2 +1,19 @@
-__pycache__/
-*.py[cod]
+# Local env and data
+.env
+data/
+*.db
+*.db-shm
+*.db-wal
+
+# Go build artifacts
+/gmail-bot
+*.exe
+*.test
+*.out
+bin/
+dist/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/

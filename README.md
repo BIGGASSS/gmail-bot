@@ -7,7 +7,7 @@ Self-hosted Telegram bot that lets a whitelisted Telegram user connect their Gma
 - Static whitelist of Telegram user IDs
 - Per-user Gmail OAuth connection
 - Long-polling Telegram bot
-- FastAPI callback endpoint for Google OAuth
+- HTTP callback endpoint for Google OAuth
 - SQLite persistence for tokens, OAuth state, and delivery dedupe
 - Inline `Expand` button to fetch full body text and attachment metadata
 
@@ -44,9 +44,21 @@ The bot requests `https://www.googleapis.com/auth/gmail.readonly`.
 ## Local run
 
 ```bash
-uv sync --extra dev
 cp .env.example .env
-uv run gmail-bot
+go run ./cmd/gmail-bot
+```
+
+Build a binary:
+
+```bash
+go build -o gmail-bot ./cmd/gmail-bot
+./gmail-bot
+```
+
+## Tests
+
+```bash
+go test ./...
 ```
 
 ## Telegram commands
@@ -59,4 +71,3 @@ uv run gmail-bot
 - `/help`
 
 Unauthorized Telegram users are ignored and logged.
-
