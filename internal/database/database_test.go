@@ -2,6 +2,7 @@ package database
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -36,6 +37,73 @@ func TestDatabaseStoresAndConsumesOAuthState(t *testing.T) {
 	}
 	if second != nil {
 		t.Fatal("expected state to be single-use")
+	}
+}
+
+func TestDatabaseFilePermissions(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "data", "bot.db")
+
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	if err := db.Initialize(ctx); err != nil {
+		t.Fatalf("initialize db: %v", err)
+	}
+
+	fileInfo, err := os.Stat(dbPath)
+	if err != nil {
+		t.Fatalf("stat db file: %v", err)
+	}
+	if perm := fileInfo.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("expected db file mode 0600, got %o", perm)
+	}
+
+	dirInfo, err := os.Stat(filepath.Dir(dbPath))
+	if err != nil {
+		t.Fatalf("stat db dir: %v", err)
+	}
+	if perm := dirInfo.Mode().Perm(); perm != 0o700 {
+		t.Fatalf("expected db dir mode 0700, got %o", perm)
+	}
+}
+
+func TestDatabaseDeleteOAuthStatesForUser(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	defer db.Close()
+
+	expiresAt := UTCNow().Add(5 * time.Minute)
+	if err := db.StoreOAuthState(ctx, "state-user-100", 100, expiresAt); err != nil {
+		t.Fatalf("store state for user 100: %v", err)
+	}
+	if err := db.StoreOAuthState(ctx, "state-user-200", 200, expiresAt); err != nil {
+		t.Fatalf("store state for user 200: %v", err)
+	}
+
+	if err := db.DeleteOAuthStatesForUser(ctx, 100); err != nil {
+		t.Fatalf("delete states for user 100: %v", err)
+	}
+
+	deleted, err := db.ConsumeOAuthState(ctx, "state-user-100")
+	if err != nil {
+		t.Fatalf("consume user 100 state: %v", err)
+	}
+	if deleted != nil {
+		t.Fatal("expected user 100 state to be deleted")
+	}
+
+	kept, err := db.ConsumeOAuthState(ctx, "state-user-200")
+	if err != nil {
+		t.Fatalf("consume user 200 state: %v", err)
+	}
+	if kept == nil {
+		t.Fatal("expected user 200 state to remain")
+	}
+	if kept.TelegramUserID != 200 {
+		t.Fatalf("expected user 200, got %d", kept.TelegramUserID)
 	}
 }
 

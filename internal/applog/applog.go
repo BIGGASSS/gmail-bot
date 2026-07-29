@@ -1,8 +1,11 @@
 package applog
 
 import (
+	"errors"
 	"fmt"
 	"log"
+	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 )
@@ -65,6 +68,28 @@ func Warningf(format string, args ...any) {
 	logf(LevelWarning, "WARNING", format, args...)
 }
 func Errorf(format string, args ...any) { logf(LevelError, "ERROR", format, args...) }
+
+var botTokenPattern = regexp.MustCompile(`bot\d+:[A-Za-z0-9_-]+`)
+
+// RedactString replaces Telegram bot tokens ("bot<id>:<secret>") in s.
+func RedactString(s string) string {
+	return botTokenPattern.ReplaceAllString(s, "bot***")
+}
+
+// RedactError renders err for logging without leaking credentials: URLs in
+// *url.Error (which may embed bot or OAuth tokens) are dropped, and any
+// remaining bot-token patterns are redacted.
+func RedactError(err error) string {
+	if err == nil {
+		return ""
+	}
+	var urlErr *url.Error
+	msg := err.Error()
+	if errors.As(err, &urlErr) {
+		msg = urlErr.Op + ": " + urlErr.Err.Error()
+	}
+	return RedactString(msg)
+}
 
 func logf(level Level, name, format string, args ...any) {
 	if level < CurrentLevel() {

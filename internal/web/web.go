@@ -48,6 +48,8 @@ func NewServer(
 		Addr:              addr,
 		Handler:           withRecovery(mux),
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      60 * time.Second,
 	}
 	return s
 }
@@ -108,6 +110,9 @@ func (s *Server) handleGoogleCallback(w http.ResponseWriter, r *http.Request) {
 
 	q := r.URL.Query()
 	if errParam := q.Get("error"); errParam != "" {
+		if len(errParam) > 200 {
+			errParam = errParam[:200] + "\u2026"
+		}
 		writeHTML(w, http.StatusBadRequest, fmt.Sprintf(
 			"<html><body><h1>Google login failed</h1><p>%s</p></body></html>",
 			html.EscapeString(errParam),

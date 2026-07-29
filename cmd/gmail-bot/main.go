@@ -61,7 +61,7 @@ func run() error {
 	oauthClient := oauth.NewClient(settings, httpClient)
 	gmailService := gmail.NewService(httpClient, oauthClient, db)
 
-	api, err := tgbotapi.NewBotAPI(settings.TelegramBotToken)
+	api, err := tgbotapi.NewBotAPIWithClient(settings.TelegramBotToken, tgbotapi.APIEndpoint, &http.Client{Timeout: 30 * time.Second})
 	if err != nil {
 		return fmt.Errorf("create telegram bot: %w", err)
 	}

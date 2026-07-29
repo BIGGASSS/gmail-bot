@@ -75,7 +75,7 @@ func (b *Bot) Run(ctx context.Context) error {
 			if ctx.Err() != nil {
 				return nil
 			}
-			applog.Warningf("Failed to get Telegram updates: %v", err)
+			applog.Warningf("Failed to get Telegram updates: %s", applog.RedactError(err))
 			applog.Warningf("Retrying Telegram updates in 3 seconds...")
 			select {
 			case <-ctx.Done():
@@ -184,6 +184,9 @@ func (b *Bot) handleLogin(ctx context.Context, message *tgbotapi.Message) {
 		applog.Errorf("Failed to cleanup OAuth states: %v", err)
 	}
 	expiresAt := database.UTCNow().Add(15 * time.Minute)
+	if err := b.database.DeleteOAuthStatesForUser(ctx, message.From.ID); err != nil {
+		applog.Errorf("Failed to clear stale OAuth states: %v", err)
+	}
 	if err := b.database.StoreOAuthState(ctx, state, message.From.ID, expiresAt); err != nil {
 		applog.Errorf("Failed to store OAuth state: %v", err)
 		return
@@ -195,10 +198,20 @@ func (b *Bot) handleLogin(ctx context.Context, message *tgbotapi.Message) {
 		"",
 		"The login link expires in 15 minutes.",
 	}, "\n"))
-	msg := tgbotapi.NewMessage(message.Chat.ID, text)
+	// Send the login link to the user's private chat
+	msg := tgbotapi.NewMessage(message.From.ID, text)
 	msg.ParseMode = "HTML"
 	if _, err := b.api.Send(msg); err != nil {
 		applog.Errorf("Failed to send login link: %v", err)
+		// If private send fails and we're in a group, tell the user to start the bot privately
+		if message.Chat.ID != message.From.ID {
+			b.reply(message.Chat.ID, "I couldn't send you the login link in a private message. Please start a private chat with me first (send /start to me directly), then use /login again.")
+		}
+		return
+	}
+	// If invoked in a group, notify the group that the link was sent privately
+	if message.Chat.ID != message.From.ID {
+		b.reply(message.Chat.ID, "I've sent you the Gmail login link in a private message.")
 	}
 }
 
@@ -305,11 +318,17 @@ func (b *Bot) handleLogout(ctx context.Context, message *tgbotapi.Message) {
 		return
 	}
 	if err := b.oauthClient.RevokeToken(ctx, account.RefreshToken); err != nil {
-		applog.Warningf("Failed to revoke Google token for %s: %v", account.GmailEmail, err)
+		applog.Warningf("Failed to revoke Google token for %s: %s", account.GmailEmail, applog.RedactError(err))
+		_ = b.database.DeleteOAuthStatesForUser(ctx, message.From.ID)
+		b.reply(message.Chat.ID, "Couldn't fully disconnect \u2014 Google token revocation failed. Your Gmail is still connected; please retry /logout later.")
+		return
 	}
 	if err := b.database.DeleteGoogleAccount(ctx, message.From.ID); err != nil {
 		applog.Errorf("Failed to delete Google account: %v", err)
 		return
+	}
+	if err := b.database.DeleteOAuthStatesForUser(ctx, message.From.ID); err != nil {
+		applog.Errorf("Failed to clear OAuth states on logout: %v", err)
 	}
 	b.reply(message.Chat.ID, "Disconnected your Gmail account. Use /login to connect again.")
 }

@@ -3,6 +3,7 @@ package oauth
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -86,25 +87,40 @@ func (c *Client) RefreshAccessToken(ctx context.Context, refreshToken string) (T
 }
 
 func (c *Client) RevokeToken(ctx context.Context, token string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, GoogleRevokeURL+"?token="+url.QueryEscape(token), nil)
+	form := url.Values{}
+	form.Set("token", token)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, GoogleRevokeURL, strings.NewReader(form.Encode()))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return err
+		return fmt.Errorf("revoke token: %w", redactURLError(err))
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusBadRequest {
 		message := strings.TrimSpace(string(body))
+		if len(message) > 256 {
+			message = message[:256] + "\u2026"
+		}
 		if message == "" {
 			message = resp.Status
 		}
 		return &OAuthError{Message: fmt.Sprintf("Google token revocation failed: %d %s", resp.StatusCode, message), StatusCode: resp.StatusCode}
 	}
 	return nil
+}
+
+// redactURLError strips the URL from transport errors so tokens in request
+// URLs cannot leak into logs. The wrapped error still supports errors.Is/As.
+func redactURLError(err error) error {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return urlErr.Err
+	}
+	return err
 }
 
 func (c *Client) postToken(ctx context.Context, form url.Values) (TokenResponse, error) {

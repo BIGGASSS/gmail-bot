@@ -17,8 +17,16 @@ type Database struct {
 }
 
 func Open(databasePath string) (*Database, error) {
-	if err := os.MkdirAll(filepath.Dir(databasePath), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(databasePath), 0o700); err != nil {
 		return nil, fmt.Errorf("create database directory: %w", err)
+	}
+
+	if _, err := os.Stat(databasePath); os.IsNotExist(err) {
+		f, err := os.OpenFile(databasePath, os.O_CREATE|os.O_WRONLY, 0o600)
+		if err != nil {
+			return nil, fmt.Errorf("create database file: %w", err)
+		}
+		_ = f.Close()
 	}
 
 	db, err := sql.Open("sqlite", databasePath)
@@ -38,7 +46,17 @@ func Open(databasePath string) (*Database, error) {
 		return nil, fmt.Errorf("enable foreign keys: %w", err)
 	}
 
+	restrictDBPermissions(databasePath)
+
 	return &Database{db: db}, nil
+}
+
+func restrictDBPermissions(databasePath string) {
+	for _, f := range []string{databasePath, databasePath + "-wal", databasePath + "-shm"} {
+		if _, err := os.Stat(f); err == nil {
+			_ = os.Chmod(f, 0o600)
+		}
+	}
 }
 
 func (d *Database) Close() error {
@@ -351,6 +369,11 @@ WHERE state = ?
 		return nil, nil
 	}
 	return oauthState, nil
+}
+
+func (d *Database) DeleteOAuthStatesForUser(ctx context.Context, telegramUserID int64) error {
+	_, err := d.db.ExecContext(ctx, `DELETE FROM oauth_states WHERE telegram_user_id = ?`, telegramUserID)
+	return err
 }
 
 func (d *Database) CleanupExpiredOAuthStates(ctx context.Context) error {

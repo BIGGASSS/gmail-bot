@@ -120,18 +120,20 @@ func (p *GmailPoller) processAccount(ctx context.Context, account models.GoogleA
 		return err
 	}
 
-	if latestHistoryID != account.LastHistoryID {
-		if err := p.database.UpdateLastHistoryID(ctx, account.TelegramUserID, latestHistoryID); err != nil {
-			return err
-		}
-	}
-
 	for _, mail := range newMessages {
 		sent, err := p.notifier.SendMailNotification(ctx, account.TelegramUserID, mail)
 		if err != nil {
 			return err
 		}
 		if err := p.database.MarkMessageDelivered(ctx, account.TelegramUserID, mail.GmailMessageID, sent.ChatID, sent.MessageID); err != nil {
+			return err
+		}
+	}
+
+	// Advance the history cursor only after every message in the batch was
+	// delivered, so a failed send or delivery mark does not skip mail.
+	if latestHistoryID != account.LastHistoryID {
+		if err := p.database.UpdateLastHistoryID(ctx, account.TelegramUserID, latestHistoryID); err != nil {
 			return err
 		}
 	}

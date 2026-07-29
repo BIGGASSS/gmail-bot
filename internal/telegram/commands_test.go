@@ -74,6 +74,18 @@ func (f *fakeUpdateClient) texts() []string {
 	return out
 }
 
+func (f *fakeUpdateClient) messagesForChat(chatID int64) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []string
+	for _, msg := range f.messages {
+		if msg.chatID == chatID {
+			out = append(out, msg.text)
+		}
+	}
+	return out
+}
+
 type fakeRevoker struct {
 	revoked []string
 	fail    bool
@@ -218,11 +230,11 @@ func TestLogoutStillDisconnectsWhenRevokeFails(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
-	if account != nil {
-		t.Fatal("expected account deleted even if revoke fails")
+	if account == nil {
+		t.Fatal("expected account retained when revoke fails")
 	}
 	texts := api.texts()
-	if len(texts) != 1 || !strings.Contains(texts[0], "Disconnected your Gmail account") {
+	if len(texts) != 1 || (!strings.Contains(texts[0], "Couldn't fully disconnect") && !strings.Contains(texts[0], "revocation failed")) {
 		t.Fatalf("logout reply=%v", texts)
 	}
 }
@@ -270,7 +282,8 @@ func TestLogoutThroughRealOAuthRevokeHTTP(t *testing.T) {
 
 	var revokedToken string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		revokedToken = r.URL.Query().Get("token")
+		_ = r.ParseForm()
+		revokedToken = r.Form.Get("token")
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer server.Close()
@@ -302,6 +315,130 @@ func TestLogoutThroughRealOAuthRevokeHTTP(t *testing.T) {
 	if account != nil {
 		t.Fatal("expected account deleted")
 	}
+}
+
+func TestLoginInvalidatesStaleStates(t *testing.T) {
+	ctx := context.Background()
+	db := openTelegramTestDB(t)
+	if err := db.StoreOAuthState(ctx, "stale-state", 1, database.UTCNow().Add(15*time.Minute)); err != nil {
+		t.Fatalf("store state: %v", err)
+	}
+
+	api := &fakeUpdateClient{}
+	bot := newTestBot(t, api, &fakeRevoker{authURL: "https://example.com/auth?state="}, db)
+	bot.HandleUpdate(ctx, commandUpdate(1, 1, "/login"))
+
+	oldState, err := db.ConsumeOAuthState(ctx, "stale-state")
+	if err != nil {
+		t.Fatalf("consume old state: %v", err)
+	}
+	if oldState != nil {
+		t.Fatal("expected stale OAuth state to be invalidated by /login")
+	}
+
+	texts := api.texts()
+	if len(texts) != 1 {
+		t.Fatalf("replies=%v", texts)
+	}
+	newState := stateFromLoginLink(t, texts[0], "https://example.com/auth?state=")
+	consumed, err := db.ConsumeOAuthState(ctx, newState)
+	if err != nil {
+		t.Fatalf("consume new state: %v", err)
+	}
+	if consumed == nil {
+		t.Fatal("expected a new OAuth state to be stored")
+	}
+	if consumed.TelegramUserID != 1 {
+		t.Fatalf("new state user=%d", consumed.TelegramUserID)
+	}
+}
+
+func TestLoginSendsToPrivateChatInGroup(t *testing.T) {
+	ctx := context.Background()
+	db := openTelegramTestDB(t)
+	api := &fakeUpdateClient{}
+	bot := newTestBot(t, api, &fakeRevoker{authURL: "https://example.com/auth?state="}, db)
+
+	bot.HandleUpdate(ctx, commandUpdate(1, -100, "/login"))
+
+	private := api.messagesForChat(1)
+	if len(private) != 1 {
+		t.Fatalf("expected 1 private message, got %v", private)
+	}
+	if !strings.Contains(private[0], "https://example.com/auth?state=") {
+		t.Fatalf("private message missing login link: %q", private[0])
+	}
+	group := api.messagesForChat(-100)
+	if len(group) != 1 {
+		t.Fatalf("expected 1 group notice, got %v", group)
+	}
+	if !strings.Contains(group[0], "private message") {
+		t.Fatalf("group notice=%q", group[0])
+	}
+	if strings.Contains(group[0], "https://example.com/auth?state=") {
+		t.Fatalf("group notice leaked login link: %q", group[0])
+	}
+}
+
+func TestLogoutRetainsAccountOnRevokeFailure(t *testing.T) {
+	ctx := context.Background()
+	db := openTelegramTestDB(t)
+	now := database.UTCNow()
+	if err := db.UpsertGoogleAccount(ctx, database.UpsertGoogleAccountParams{
+		TelegramUserID:         1,
+		GmailEmail:             "user@example.com",
+		AccessToken:            "access",
+		RefreshToken:           "refresh-token",
+		TokenExpiry:            now.Add(time.Hour),
+		LastHistoryID:          "10",
+		ConnectedAt:            now,
+		ReloginPromptEnabled:   true,
+		ReloginPromptDelayDays: 6,
+	}); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	if err := db.StoreOAuthState(ctx, "pending-state", 1, now.Add(15*time.Minute)); err != nil {
+		t.Fatalf("store state: %v", err)
+	}
+
+	api := &fakeUpdateClient{}
+	bot := newTestBot(t, api, &fakeRevoker{fail: true}, db)
+	bot.HandleUpdate(ctx, commandUpdate(1, 1, "/logout"))
+
+	account, err := db.GetGoogleAccount(ctx, 1)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if account == nil {
+		t.Fatal("expected account retained when revoke fails")
+	}
+	texts := api.texts()
+	if len(texts) != 1 || (!strings.Contains(texts[0], "Couldn't fully disconnect") && !strings.Contains(texts[0], "revocation failed")) {
+		t.Fatalf("logout reply=%v", texts)
+	}
+	state, err := db.ConsumeOAuthState(ctx, "pending-state")
+	if err != nil {
+		t.Fatalf("consume state: %v", err)
+	}
+	if state != nil {
+		t.Fatal("expected OAuth states cleared on failed logout")
+	}
+}
+
+func stateFromLoginLink(t *testing.T, text, prefix string) string {
+	t.Helper()
+	start := strings.Index(text, prefix)
+	if start < 0 {
+		t.Fatalf("missing login link prefix in %q", text)
+	}
+	rest := text[start+len(prefix):]
+	if end := strings.IndexAny(rest, "\n \t\"<>"); end >= 0 {
+		rest = rest[:end]
+	}
+	if rest == "" {
+		t.Fatalf("empty state in %q", text)
+	}
+	return rest
 }
 
 func commandUpdate(userID, chatID int64, text string) tgbotapi.Update {

@@ -185,6 +185,113 @@ func TestListNewInboxMessagesPaginatesAndFilters(t *testing.T) {
 	}
 }
 
+func TestListNewInboxMessagesCapsMessageCount(t *testing.T) {
+	store := newMemoryStore()
+	received := time.Date(2024, 2, 1, 0, 0, 0, 0, time.UTC)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/gmail/v1/users/me/history"):
+			added := make([]any, 0, 60)
+			for i := 0; i < 60; i++ {
+				added = append(added, map[string]any{"message": map[string]any{"id": itoa(int64(i))}})
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"historyId": "300",
+				"history": []any{
+					map[string]any{
+						"id":            "300",
+						"messagesAdded": added,
+					},
+				},
+			})
+		case strings.HasPrefix(r.URL.Path, "/gmail/v1/users/me/messages/"):
+			id := strings.TrimPrefix(r.URL.Path, "/gmail/v1/users/me/messages/")
+			writeMessage(w, id, []string{"INBOX"}, "Flood", received)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	service := newTestService(t, server.URL, store)
+	account := models.GoogleAccount{
+		TelegramUserID: 7,
+		AccessToken:    "access-token",
+		RefreshToken:   "refresh-token",
+		TokenExpiry:    time.Now().UTC().Add(time.Hour),
+		LastHistoryID:  "100",
+		ConnectedAt:    received.Add(-time.Hour),
+	}
+
+	messages, latest, err := service.ListNewInboxMessages(context.Background(), account)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(messages) > maxMessagesPerPoll {
+		t.Fatalf("expected at most %d messages, got %d", maxMessagesPerPoll, len(messages))
+	}
+	if latest != "300" {
+		t.Fatalf("latest history=%q", latest)
+	}
+}
+
+func TestListNewInboxMessagesCapsHistoryPages(t *testing.T) {
+	store := newMemoryStore()
+	received := time.Date(2024, 2, 1, 0, 0, 0, 0, time.UTC)
+
+	var historyCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/gmail/v1/users/me/history"):
+			historyCalls++
+			latestID := itoa(int64(100 + historyCalls))
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"historyId": latestID,
+				"history": []any{
+					map[string]any{
+						"id": latestID,
+						"messagesAdded": []any{
+							map[string]any{"message": map[string]any{"id": "msg-" + latestID}},
+						},
+					},
+				},
+				"nextPageToken": "page-" + itoa(int64(historyCalls+1)),
+			})
+		case strings.HasPrefix(r.URL.Path, "/gmail/v1/users/me/messages/"):
+			id := strings.TrimPrefix(r.URL.Path, "/gmail/v1/users/me/messages/")
+			writeMessage(w, id, []string{"INBOX"}, "Paged", received)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	service := newTestService(t, server.URL, store)
+	account := models.GoogleAccount{
+		TelegramUserID: 7,
+		AccessToken:    "access-token",
+		RefreshToken:   "refresh-token",
+		TokenExpiry:    time.Now().UTC().Add(time.Hour),
+		LastHistoryID:  "100",
+		ConnectedAt:    received.Add(-time.Hour),
+	}
+
+	messages, latest, err := service.ListNewInboxMessages(context.Background(), account)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if historyCalls != maxHistoryPages {
+		t.Fatalf("expected %d history page requests, got %d", maxHistoryPages, historyCalls)
+	}
+	if latest != "110" {
+		t.Fatalf("latest history=%q", latest)
+	}
+	if len(messages) != maxHistoryPages {
+		t.Fatalf("expected %d messages, got %d", maxHistoryPages, len(messages))
+	}
+}
+
 func TestListNewInboxMessagesHistoryExpired(t *testing.T) {
 	store := newMemoryStore()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

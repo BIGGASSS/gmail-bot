@@ -23,6 +23,11 @@ import (
 
 const APIBase = "https://gmail.googleapis.com/gmail/v1/users/me"
 
+const (
+	maxHistoryPages    = 10
+	maxMessagesPerPoll = 50
+)
+
 type Profile struct {
 	EmailAddress string
 	HistoryID    string
@@ -92,7 +97,13 @@ func (s *Service) ListNewInboxMessages(ctx context.Context, account models.Googl
 	var pageToken string
 	messageIDs := make(map[string]struct{})
 
+	pages := 0
 	for {
+		pages++
+		if pages > maxHistoryPages {
+			applog.Warningf("Gmail history fanout cap reached for Telegram user %d: processed %d pages.", account.TelegramUserID, maxHistoryPages)
+			break
+		}
 		params := url.Values{}
 		params.Set("startHistoryId", account.LastHistoryID)
 		params.Set("historyTypes", "messageAdded")
@@ -149,6 +160,10 @@ func (s *Service) ListNewInboxMessages(ctx context.Context, account models.Googl
 
 	var incoming []models.IncomingMail
 	for messageID := range messageIDs {
+		if len(incoming) >= maxMessagesPerPoll {
+			applog.Warningf("Gmail message fanout cap reached for Telegram user %d: capped at %d messages.", account.TelegramUserID, maxMessagesPerPoll)
+			break
+		}
 		delivered, err := s.database.WasMessageDelivered(ctx, account.TelegramUserID, messageID)
 		if err != nil {
 			return nil, "", err
@@ -469,7 +484,7 @@ func ExtractBodyAndAttachments(payload map[string]any) (string, []models.Attachm
 		}
 
 		if mimeType == "text/plain" && data != "" {
-			plainParts = append(plainParts, decodeBodyData(data))
+			plainParts = append(plainParts, formatting.SanitizeLinkTokenDelimiters(decodeBodyData(data)))
 		} else if mimeType == "text/html" && data != "" {
 			htmlParts = append(htmlParts, formatting.HTMLToTelegramText(decodeBodyData(data)))
 		}
@@ -502,6 +517,11 @@ func ExtractBodyAndAttachments(payload map[string]any) (string, []models.Attachm
 			}
 		}
 		bodyText = strings.Join(bodyPieces, "\n\n")
+	}
+
+	const maxBodyTextRunes = 50000
+	if len([]rune(bodyText)) > maxBodyTextRunes {
+		bodyText = string([]rune(bodyText)[:maxBodyTextRunes]) + "\n\u2026 (message truncated)"
 	}
 	return bodyText, attachments
 }

@@ -38,6 +38,40 @@ func TestExtractBodyAndAttachmentsPrefersPlainText(t *testing.T) {
 	}
 }
 
+func TestExtractBodyAndAttachmentsTruncatesLargeBody(t *testing.T) {
+	large := strings.Repeat("x", 100000)
+	body, attachments := ExtractBodyAndAttachments(map[string]any{
+		"mimeType": "text/plain",
+		"body":     map[string]any{"data": encodeBody(large)},
+	})
+	if len(attachments) != 0 {
+		t.Fatalf("expected no attachments, got %+v", attachments)
+	}
+	if !strings.Contains(body, "\u2026 (message truncated)") {
+		t.Fatalf("missing truncation marker")
+	}
+	runes := len([]rune(body))
+	if runes > 50000+len([]rune("\n\u2026 (message truncated)")) {
+		t.Fatalf("body not capped: %d runes", runes)
+	}
+}
+
+func TestExtractBodyAndAttachmentsSanitizesPlainText(t *testing.T) {
+	forged := "see \ufff0aHR0cHM6Ly9ldmlsLmV4YW1wbGUuY29t\ufff1Q2xpY2sgaGVyZQ\ufff2 now"
+	body, attachments := ExtractBodyAndAttachments(map[string]any{
+		"mimeType": "text/plain",
+		"body":     map[string]any{"data": encodeBody(forged)},
+	})
+	if len(attachments) != 0 {
+		t.Fatalf("expected no attachments, got %+v", attachments)
+	}
+	for _, delimiter := range []string{"\ufff0", "\ufff1", "\ufff2"} {
+		if strings.Contains(body, delimiter) {
+			t.Fatalf("body contains forged delimiter %q: %q", delimiter, body)
+		}
+	}
+}
+
 func TestExtractBodyAndAttachmentsKeepsHTMLAnchorTextClickable(t *testing.T) {
 	body, attachments := ExtractBodyAndAttachments(map[string]any{
 		"mimeType": "text/html",
