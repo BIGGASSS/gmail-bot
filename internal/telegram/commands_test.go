@@ -2,6 +2,7 @@ package telegram
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -230,11 +231,11 @@ func TestLogoutStillDisconnectsWhenRevokeFails(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
-	if account == nil {
-		t.Fatal("expected account retained when revoke fails")
+	if account != nil {
+		t.Fatal("expected local account deleted when revoke fails")
 	}
 	texts := api.texts()
-	if len(texts) != 1 || (!strings.Contains(texts[0], "Couldn't fully disconnect") && !strings.Contains(texts[0], "revocation failed")) {
+	if len(texts) != 1 || (!strings.Contains(texts[0], "revocation failed") || !strings.Contains(texts[0], "https://myaccount.google.com/connections") || !strings.Contains(texts[0], "forwarding has stopped")) {
 		t.Fatalf("logout reply=%v", texts)
 	}
 }
@@ -380,7 +381,7 @@ func TestLoginSendsToPrivateChatInGroup(t *testing.T) {
 	}
 }
 
-func TestLogoutRetainsAccountOnRevokeFailure(t *testing.T) {
+func TestLogoutClearsStatesOnRevokeFailure(t *testing.T) {
 	ctx := context.Background()
 	db := openTelegramTestDB(t)
 	now := database.UTCNow()
@@ -409,11 +410,11 @@ func TestLogoutRetainsAccountOnRevokeFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
-	if account == nil {
-		t.Fatal("expected account retained when revoke fails")
+	if account != nil {
+		t.Fatal("expected local account deleted when revoke fails")
 	}
 	texts := api.texts()
-	if len(texts) != 1 || (!strings.Contains(texts[0], "Couldn't fully disconnect") && !strings.Contains(texts[0], "revocation failed")) {
+	if len(texts) != 1 || (!strings.Contains(texts[0], "revocation failed") || !strings.Contains(texts[0], "https://myaccount.google.com/connections") || !strings.Contains(texts[0], "forwarding has stopped")) {
 		t.Fatalf("logout reply=%v", texts)
 	}
 	state, err := db.ConsumeOAuthState(ctx, "pending-state")
@@ -422,6 +423,30 @@ func TestLogoutRetainsAccountOnRevokeFailure(t *testing.T) {
 	}
 	if state != nil {
 		t.Fatal("expected OAuth states cleared on failed logout")
+	}
+}
+
+func TestLogoutWithoutAccountInvalidatesPendingLogin(t *testing.T) {
+	ctx := context.Background()
+	db := openTelegramTestDB(t)
+	for _, user := range []int64{1, 2} {
+		if err := db.StoreOAuthState(ctx, fmt.Sprint(user), user, database.UTCNow().Add(time.Minute)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	revoker := &fakeRevoker{}
+	bot := newTestBot(t, &fakeUpdateClient{}, revoker, db)
+	bot.HandleUpdate(ctx, commandUpdate(1, 1, "/logout"))
+	state, err := db.ConsumeOAuthState(ctx, "1")
+	if err != nil || state != nil {
+		t.Fatalf("pending login survived: %v, %v", state, err)
+	}
+	other, err := db.ConsumeOAuthState(ctx, "2")
+	if err != nil || other == nil {
+		t.Fatalf("other user's login invalidated: %v, %v", other, err)
+	}
+	if len(revoker.revoked) != 0 {
+		t.Fatal("revoked without an account")
 	}
 }
 

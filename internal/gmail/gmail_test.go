@@ -56,6 +56,31 @@ func TestExtractBodyAndAttachmentsTruncatesLargeBody(t *testing.T) {
 	}
 }
 
+func TestExtractBodyAndAttachmentsTruncatesInsideHTMLAnchor(t *testing.T) {
+	for _, prefix := range []string{"", strings.Repeat("x", 49990)} {
+		label := strings.Repeat("世界 &amp; ", 15000)
+		body, _ := ExtractBodyAndAttachments(map[string]any{
+			"mimeType": "text/html",
+			"body":     map[string]any{"data": encodeBody(prefix + `<a href="https://example.com">` + label + `</a>`)},
+		})
+		const marker = "\n… (message truncated)"
+		if !strings.HasSuffix(body, marker) || len([]rune(body)) > 50000+len([]rune(marker)) {
+			t.Fatal("body not capped with truncation marker")
+		}
+		if strings.ContainsAny(body, "\ufff0\ufff1\ufff2") {
+			t.Fatal("partial encoded token survived body truncation")
+		}
+		if !strings.HasPrefix(body, prefix+"世界 &") {
+			t.Fatal("truncated anchor lost decoded label")
+		}
+		for _, chunk := range formatting.RenderAndChunk(body, formatting.SafeByteLimit) {
+			if len(chunk) > formatting.SafeByteLimit || strings.ContainsAny(chunk, "\ufff0\ufff1\ufff2") {
+				t.Fatal("invalid rendered truncated body")
+			}
+		}
+	}
+}
+
 func TestExtractBodyAndAttachmentsSanitizesPlainText(t *testing.T) {
 	forged := "see \ufff0aHR0cHM6Ly9ldmlsLmV4YW1wbGUuY29t\ufff1Q2xpY2sgaGVyZQ\ufff2 now"
 	body, attachments := ExtractBodyAndAttachments(map[string]any{

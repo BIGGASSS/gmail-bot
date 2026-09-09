@@ -308,6 +308,12 @@ func (b *Bot) handleReloginReminder(ctx context.Context, message *tgbotapi.Messa
 }
 
 func (b *Bot) handleLogout(ctx context.Context, message *tgbotapi.Message) {
+	// Invalidate pending login links even when no account is connected.
+	if err := b.database.DeleteOAuthStatesForUser(ctx, message.From.ID); err != nil {
+		applog.Errorf("Failed to clear OAuth states on logout: %v", err)
+		b.reply(message.Chat.ID, "Couldn't disconnect safely. Please retry /logout.")
+		return
+	}
 	account, err := b.database.GetGoogleAccount(ctx, message.From.ID)
 	if err != nil {
 		applog.Errorf("Failed to load account for /logout: %v", err)
@@ -317,18 +323,16 @@ func (b *Bot) handleLogout(ctx context.Context, message *tgbotapi.Message) {
 		b.reply(message.Chat.ID, "No Gmail account is currently connected.")
 		return
 	}
-	if err := b.oauthClient.RevokeToken(ctx, account.RefreshToken); err != nil {
-		applog.Warningf("Failed to revoke Google token for %s: %s", account.GmailEmail, applog.RedactError(err))
-		_ = b.database.DeleteOAuthStatesForUser(ctx, message.From.ID)
-		b.reply(message.Chat.ID, "Couldn't fully disconnect \u2014 Google token revocation failed. Your Gmail is still connected; please retry /logout later.")
-		return
-	}
+	// Honor local disconnect immediately, independent of Google's availability.
 	if err := b.database.DeleteGoogleAccount(ctx, message.From.ID); err != nil {
 		applog.Errorf("Failed to delete Google account: %v", err)
+		b.reply(message.Chat.ID, "Couldn't disconnect locally. Please retry /logout.")
 		return
 	}
-	if err := b.database.DeleteOAuthStatesForUser(ctx, message.From.ID); err != nil {
-		applog.Errorf("Failed to clear OAuth states on logout: %v", err)
+	if err := b.oauthClient.RevokeToken(ctx, account.RefreshToken); err != nil {
+		applog.Warningf("Failed to revoke Google token for %s: %v", account.GmailEmail, err)
+		b.reply(message.Chat.ID, "Disconnected your Gmail account locally; automatic forwarding has stopped. Google token revocation failed. Manually revoke this bot's access at https://myaccount.google.com/connections . Use /login to connect again.")
+		return
 	}
 	b.reply(message.Chat.ID, "Disconnected your Gmail account. Use /login to connect again.")
 }

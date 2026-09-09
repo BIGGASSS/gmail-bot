@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -192,6 +193,10 @@ func TestListNewInboxMessagesCapsMessageCount(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.HasPrefix(r.URL.Path, "/gmail/v1/users/me/history"):
+			if r.URL.Query().Get("startHistoryId") == "300" {
+				_ = json.NewEncoder(w).Encode(map[string]any{"historyId": "300"})
+				return
+			}
 			added := make([]any, 0, 60)
 			for i := 0; i < 60; i++ {
 				added = append(added, map[string]any{"message": map[string]any{"id": itoa(int64(i))}})
@@ -228,11 +233,33 @@ func TestListNewInboxMessagesCapsMessageCount(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
-	if len(messages) > maxMessagesPerPoll {
-		t.Fatalf("expected at most %d messages, got %d", maxMessagesPerPoll, len(messages))
+	if len(messages) != maxMessagesPerPoll {
+		t.Fatalf("expected %d messages, got %d", maxMessagesPerPoll, len(messages))
 	}
-	if latest != "300" {
-		t.Fatalf("latest history=%q", latest)
+	if latest != "100" {
+		t.Fatalf("partial record advanced cursor: %q", latest)
+	}
+	for _, message := range messages {
+		store.markDelivered(account.TelegramUserID, message.GmailMessageID)
+	}
+	account.LastHistoryID = latest
+	messages, latest, err = service.ListNewInboxMessages(context.Background(), account)
+	if err != nil || len(messages) != 10 || latest != "300" {
+		t.Fatalf("second poll: count=%d cursor=%q err=%v", len(messages), latest, err)
+	}
+	for _, message := range messages {
+		if delivered, _ := store.WasMessageDelivered(context.Background(), account.TelegramUserID, message.GmailMessageID); delivered {
+			t.Fatalf("duplicate notification: %s", message.GmailMessageID)
+		}
+		store.markDelivered(account.TelegramUserID, message.GmailMessageID)
+	}
+	if len(store.delivered) != 60 {
+		t.Fatalf("delivered %d of 60 messages", len(store.delivered))
+	}
+	account.LastHistoryID = latest
+	messages, latest, err = service.ListNewInboxMessages(context.Background(), account)
+	if err != nil || len(messages) != 0 || latest != "300" {
+		t.Fatalf("third poll: count=%d cursor=%q err=%v", len(messages), latest, err)
 	}
 }
 
@@ -245,9 +272,21 @@ func TestListNewInboxMessagesCapsHistoryPages(t *testing.T) {
 		switch {
 		case strings.HasPrefix(r.URL.Path, "/gmail/v1/users/me/history"):
 			historyCalls++
-			latestID := itoa(int64(100 + historyCalls))
+			start, _ := strconv.Atoi(r.URL.Query().Get("startHistoryId"))
+			if token := r.URL.Query().Get("pageToken"); token != "" {
+				start, _ = strconv.Atoi(token)
+			}
+			if start >= 113 {
+				_ = json.NewEncoder(w).Encode(map[string]any{"historyId": "200"})
+				return
+			}
+			latestID := strconv.Itoa(start + 1)
+			next := latestID
+			if start == 112 {
+				next = ""
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"historyId": latestID,
+				"historyId": "200",
 				"history": []any{
 					map[string]any{
 						"id": latestID,
@@ -256,7 +295,7 @@ func TestListNewInboxMessagesCapsHistoryPages(t *testing.T) {
 						},
 					},
 				},
-				"nextPageToken": "page-" + itoa(int64(historyCalls+1)),
+				"nextPageToken": next,
 			})
 		case strings.HasPrefix(r.URL.Path, "/gmail/v1/users/me/messages/"):
 			id := strings.TrimPrefix(r.URL.Path, "/gmail/v1/users/me/messages/")
@@ -289,6 +328,148 @@ func TestListNewInboxMessagesCapsHistoryPages(t *testing.T) {
 	}
 	if len(messages) != maxHistoryPages {
 		t.Fatalf("expected %d messages, got %d", maxHistoryPages, len(messages))
+	}
+	for _, message := range messages {
+		store.markDelivered(account.TelegramUserID, message.GmailMessageID)
+	}
+	account.LastHistoryID = latest
+	messages, latest, err = service.ListNewInboxMessages(context.Background(), account)
+	if err != nil || len(messages) != 3 || latest != "200" || historyCalls != 13 {
+		t.Fatalf("second poll: count=%d cursor=%q calls=%d err=%v", len(messages), latest, historyCalls, err)
+	}
+	for _, message := range messages {
+		store.markDelivered(account.TelegramUserID, message.GmailMessageID)
+	}
+	if len(store.delivered) != 13 {
+		t.Fatalf("delivered %d of 13 messages", len(store.delivered))
+	}
+	account.LastHistoryID = latest
+	messages, latest, err = service.ListNewInboxMessages(context.Background(), account)
+	if err != nil || len(messages) != 0 || latest != "200" {
+		t.Fatalf("third poll: count=%d cursor=%q err=%v", len(messages), latest, err)
+	}
+}
+
+// Gmail's mailbox cursor can be much newer than the records in a page.
+// Both the message cap and the metadata budget must leave later records pending.
+func TestListNewInboxMessagesResumesRecordsAcrossPolls(t *testing.T) {
+	for _, filtered := range []bool{false, true} {
+		t.Run(strconv.FormatBool(filtered), func(t *testing.T) {
+			store := newMemoryStore()
+			received := time.Date(2024, 2, 1, 0, 0, 0, 0, time.UTC)
+			metadataCalls := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case strings.HasSuffix(r.URL.Path, "/history"):
+					start, _ := strconv.Atoi(r.URL.Query().Get("startHistoryId"))
+					var history []any
+					for id := start + 1; id <= 220; id++ {
+						history = append(history, map[string]any{
+							"id": strconv.Itoa(id),
+							"messagesAdded": []any{
+								map[string]any{"message": map[string]any{"id": strconv.Itoa(id)}},
+							},
+						})
+					}
+					_ = json.NewEncoder(w).Encode(map[string]any{"historyId": "999", "history": history})
+				case strings.Contains(r.URL.Path, "/messages/"):
+					metadataCalls++
+					id := strings.TrimPrefix(r.URL.Path, "/gmail/v1/users/me/messages/")
+					labels := []string{"INBOX"}
+					date := received
+					if filtered && id != "220" {
+						if n, _ := strconv.Atoi(id); n%2 == 0 {
+							labels = []string{"SPAM"}
+						} else {
+							date = received.Add(-2 * time.Hour)
+						}
+					}
+					writeMessage(w, id, labels, "Backlog", date)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+			service := newTestService(t, server.URL, store)
+			account := models.GoogleAccount{
+				TelegramUserID: 7, AccessToken: "access-token",
+				TokenExpiry: time.Now().Add(time.Hour), LastHistoryID: "100",
+				ConnectedAt: received.Add(-time.Hour),
+			}
+			for poll, wantCursor := range []string{"150", "200", "999", "999"} {
+				metadataCalls = 0
+				messages, cursor, err := service.ListNewInboxMessages(context.Background(), account)
+				if err != nil || cursor != wantCursor {
+					t.Fatalf("poll %d: cursor=%q want=%q err=%v", poll, cursor, wantCursor, err)
+				}
+				if metadataCalls > maxMessagesPerPoll {
+					t.Fatalf("poll %d: %d metadata requests", poll, metadataCalls)
+				}
+				for _, message := range messages {
+					if delivered, _ := store.WasMessageDelivered(context.Background(), account.TelegramUserID, message.GmailMessageID); delivered {
+						t.Fatalf("duplicate notification: %s", message.GmailMessageID)
+					}
+					store.markDelivered(account.TelegramUserID, message.GmailMessageID)
+				}
+				account.LastHistoryID = cursor
+			}
+			wantCount := 120
+			if filtered {
+				wantCount = 1
+			}
+			if len(store.delivered) != wantCount || !store.delivered[key(7, "220")] {
+				t.Fatalf("delivered %d, want %d including final message", len(store.delivered), wantCount)
+			}
+		})
+	}
+}
+
+func TestListNewInboxMessagesLargeFilteredRecordMakesProgress(t *testing.T) {
+	store := newMemoryStore()
+	received := time.Date(2024, 2, 1, 0, 0, 0, 0, time.UTC)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/history") {
+			var history []any
+			if r.URL.Query().Get("startHistoryId") == "100" {
+				var added []any
+				for id := 1; id <= 120; id++ {
+					added = append(added, map[string]any{"message": map[string]any{"id": strconv.Itoa(id)}})
+				}
+				history = []any{map[string]any{"id": "200", "messagesAdded": added}}
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"historyId": "300", "history": history})
+			return
+		}
+		id := strings.TrimPrefix(r.URL.Path, "/gmail/v1/users/me/messages/")
+		labels := []string{"INBOX"}
+		if n, _ := strconv.Atoi(id); n <= 60 {
+			labels = []string{"SPAM"}
+		}
+		writeMessage(w, id, labels, "Large record", received)
+	}))
+	defer server.Close()
+	service := newTestService(t, server.URL, store)
+	account := models.GoogleAccount{
+		TelegramUserID: 7, AccessToken: "access-token",
+		TokenExpiry: time.Now().Add(time.Hour), LastHistoryID: "100",
+		ConnectedAt: received.Add(-time.Hour),
+	}
+	for poll, wantCount := range []int{50, 10, 0} {
+		messages, cursor, err := service.ListNewInboxMessages(context.Background(), account)
+		wantCursor := "300"
+		if poll == 0 {
+			wantCursor = "100"
+		}
+		if err != nil || len(messages) != wantCount || cursor != wantCursor {
+			t.Fatalf("poll %d: count=%d cursor=%q err=%v", poll, len(messages), cursor, err)
+		}
+		for _, message := range messages {
+			store.markDelivered(account.TelegramUserID, message.GmailMessageID)
+		}
+		account.LastHistoryID = cursor
+	}
+	if len(store.delivered) != 60 {
+		t.Fatalf("delivered %d of 60 inbox messages", len(store.delivered))
 	}
 }
 

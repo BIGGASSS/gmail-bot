@@ -69,11 +69,28 @@ func Warningf(format string, args ...any) {
 }
 func Errorf(format string, args ...any) { logf(LevelError, "ERROR", format, args...) }
 
-var botTokenPattern = regexp.MustCompile(`bot\d+:[A-Za-z0-9_-]+`)
+var (
+	botTokenPattern   = regexp.MustCompile(`bot\d+:[A-Za-z0-9_-]+`)
+	urlPattern        = regexp.MustCompile(`https?://[^\s"'<>]+`)
+	credentialPattern = regexp.MustCompile(`(?i)((?:access_token|refresh_token|client_secret|token|code|state)["']?\s*[:=]\s*["']?)[^\s"'&,}]+`)
+)
 
-// RedactString replaces Telegram bot tokens ("bot<id>:<secret>") in s.
+// RedactString sanitizes URLs and labeled credentials before any log output.
+// Entire query strings are removed: OAuth callback URLs can contain secrets.
 func RedactString(s string) string {
-	return botTokenPattern.ReplaceAllString(s, "bot***")
+	s = urlPattern.ReplaceAllStringFunc(s, func(raw string) string {
+		u, err := url.Parse(raw)
+		if err != nil {
+			return "[redacted URL]"
+		}
+		u.User = nil
+		u.RawQuery = ""
+		u.ForceQuery = false
+		u.Fragment = ""
+		return u.String()
+	})
+	s = botTokenPattern.ReplaceAllString(s, "bot***")
+	return credentialPattern.ReplaceAllString(s, "${1}[redacted]")
 }
 
 // RedactError renders err for logging without leaking credentials: URLs in
@@ -95,5 +112,11 @@ func logf(level Level, name, format string, args ...any) {
 	if level < CurrentLevel() {
 		return
 	}
-	log.Printf("%s %s", name, fmt.Sprintf(format, args...))
+	safeArgs := append([]any(nil), args...)
+	for i, arg := range safeArgs {
+		if err, ok := arg.(error); ok {
+			safeArgs[i] = RedactError(err)
+		}
+	}
+	log.Printf("%s %s", name, RedactString(fmt.Sprintf(format, safeArgs...)))
 }

@@ -26,7 +26,15 @@ func Open(databasePath string) (*Database, error) {
 		if err != nil {
 			return nil, fmt.Errorf("create database file: %w", err)
 		}
-		_ = f.Close()
+		if err := f.Close(); err != nil {
+			return nil, fmt.Errorf("close database file: %w", err)
+		}
+	} else if err != nil {
+		return nil, fmt.Errorf("stat database file: %w", err)
+	}
+	// Restrict existing files before SQLite reads secrets or creates sidecars.
+	if err := restrictDBPermissions(databasePath); err != nil {
+		return nil, err
 	}
 
 	db, err := sql.Open("sqlite", databasePath)
@@ -46,17 +54,25 @@ func Open(databasePath string) (*Database, error) {
 		return nil, fmt.Errorf("enable foreign keys: %w", err)
 	}
 
-	restrictDBPermissions(databasePath)
+	if err := restrictDBPermissions(databasePath); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 
 	return &Database{db: db}, nil
 }
 
-func restrictDBPermissions(databasePath string) {
-	for _, f := range []string{databasePath, databasePath + "-wal", databasePath + "-shm"} {
-		if _, err := os.Stat(f); err == nil {
-			_ = os.Chmod(f, 0o600)
+func restrictDBPermissions(databasePath string) error {
+	for i, f := range []string{databasePath, databasePath + "-wal", databasePath + "-shm"} {
+		if err := os.Chmod(f, 0o600); err != nil {
+			// SQLite creates sidecars lazily; only those may be absent.
+			if i > 0 && os.IsNotExist(err) {
+				continue
+			}
+			return fmt.Errorf("restrict database permissions for %s: %w", f, err)
 		}
 	}
+	return nil
 }
 
 func (d *Database) Close() error {

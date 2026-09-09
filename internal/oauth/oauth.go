@@ -99,16 +99,9 @@ func (c *Client) RevokeToken(ctx context.Context, token string) error {
 		return fmt.Errorf("revoke token: %w", redactURLError(err))
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusBadRequest {
-		message := strings.TrimSpace(string(body))
-		if len(message) > 256 {
-			message = message[:256] + "\u2026"
-		}
-		if message == "" {
-			message = resp.Status
-		}
-		return &OAuthError{Message: fmt.Sprintf("Google token revocation failed: %d %s", resp.StatusCode, message), StatusCode: resp.StatusCode}
+		// Never log response bodies: an upstream error may echo credentials.
+		return &OAuthError{Message: fmt.Sprintf("Google token revocation failed: HTTP %d", resp.StatusCode), StatusCode: resp.StatusCode}
 	}
 	return nil
 }
@@ -150,10 +143,6 @@ func decodeJSONResponse(resp *http.Response) (map[string]any, error) {
 	if resp.StatusCode >= 400 {
 		var payload map[string]any
 		_ = json.Unmarshal(body, &payload)
-		message := strings.TrimSpace(string(body))
-		if message == "" {
-			message = resp.Status
-		}
 		errCode := ""
 		errDesc := ""
 		if payload != nil {
@@ -165,7 +154,7 @@ func decodeJSONResponse(resp *http.Response) (map[string]any, error) {
 			}
 		}
 		return nil, &OAuthError{
-			Message:          fmt.Sprintf("Google OAuth request failed: %d %s", resp.StatusCode, message),
+			Message:          fmt.Sprintf("Google OAuth request failed: HTTP %d", resp.StatusCode),
 			StatusCode:       resp.StatusCode,
 			ErrorCode:        errCode,
 			ErrorDescription: errDesc,

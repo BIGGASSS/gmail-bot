@@ -17,8 +17,8 @@ const (
 	TelegramMessageLimit = 4096
 	SafeMessageChunk     = 3500
 	// SafeByteLimit is a byte budget for rendered HTML. Telegram's limit is
-	// 4096 UTF-16 code units; every UTF-8 byte corresponds to at least one
-	// UTF-16 code unit, so 3900 bytes is safely under the limit.
+	// 4096 UTF-16 code units. Valid UTF-8 text uses at least as many bytes
+	// as UTF-16 code units, so 3900 rendered bytes is a conservative limit.
 	SafeByteLimit      = 3900
 	linkTokenStart     = "\ufff0"
 	linkTokenSeparator = "\ufff1"
@@ -316,7 +316,8 @@ func FormatAttachmentLines(attachments []models.AttachmentMeta) []string {
 		if mimeType == "" {
 			mimeType = "application/octet-stream"
 		}
-		lines = append(lines, fmt.Sprintf("- %s [%s, %s]", name, mimeType, sizeSuffix))
+		lines = append(lines, fmt.Sprintf("- %s [%s, %s]",
+			SanitizeLinkTokenDelimiters(name), SanitizeLinkTokenDelimiters(mimeType), sizeSuffix))
 	}
 	return lines
 }
@@ -397,38 +398,136 @@ func ChunkText(value string, limit int) []string {
 	return chunks
 }
 
-// RenderAndChunk renders value to Telegram HTML and splits the result into
-// chunks that each fit within byteLimit bytes. The returned chunks are
-// already rendered HTML — callers must NOT call RenderTelegramHTML again.
+// TruncateText caps the internal representation at limit runes without cutting
+// an encoded link token. A link crossing the cutoff falls back to decoded text.
+func TruncateText(value string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	runes := []rune(value)
+	if len(runes) <= limit {
+		return value
+	}
+	cutoff := len(string(runes[:limit]))
+	for _, match := range linkTokenPattern.FindAllStringSubmatchIndex(value, -1) {
+		if match[0] >= cutoff {
+			break
+		}
+		if match[1] > cutoff {
+			label, _ := decodeLinkComponent(value[match[2]:match[3]])
+			url, _ := decodeLinkComponent(value[match[4]:match[5]])
+			plain := []rune(SanitizeLinkTokenDelimiters(linkPlainText(label, url)))
+			remaining := limit - len([]rune(value[:match[0]]))
+			if len(plain) > remaining {
+				plain = plain[:remaining]
+			}
+			return value[:match[0]] + string(plain)
+		}
+	}
+	return string(runes[:limit])
+}
+
+func linkPlainText(label, url string) string {
+	if label == url {
+		return label
+	}
+	return label + " <" + url + ">"
+}
+
+// RenderAndChunk renders complete tokens before splitting decoded text. Long
+// labels repeat the original target on each fragment; targets too large for an
+// anchor fall back to plain label/URL text. HTML entities and UTF-8 runes remain
+// intact. Limits below 6 are raised to 6 (the longest escaped single rune).
+// Callers must NOT call RenderTelegramHTML on the returned chunks again.
 func RenderAndChunk(value string, byteLimit int) []string {
 	if byteLimit <= 0 {
 		byteLimit = SafeByteLimit
 	}
-	rendered := RenderTelegramHTML(value)
-	if len(rendered) <= byteLimit {
-		return []string{rendered}
+	if byteLimit < 6 {
+		byteLimit = 6
 	}
-	return renderAndChunk(value, byteLimit, SafeMessageChunk)
-}
-
-func renderAndChunk(value string, byteLimit, runeLimit int) []string {
-	rendered := RenderTelegramHTML(value)
-	if len(rendered) <= byteLimit {
-		return []string{rendered}
+	var chunks []string
+	var current strings.Builder
+	flush := func() {
+		if current.Len() > 0 {
+			chunks = append(chunks, current.String())
+			current.Reset()
+		}
 	}
-	if runeLimit <= 1 {
-		// Can't split further; a single rune renders to at most a few bytes,
-		// but an unsplittable link token may exceed the limit. Best effort.
-		return []string{rendered}
+	appendHTML := func(fragment string) {
+		if current.Len()+len(fragment) > byteLimit {
+			flush()
+		}
+		current.WriteString(fragment)
 	}
-	chunks := ChunkText(value, runeLimit)
-	if len(chunks) <= 1 {
-		// Couldn't split at this limit; retry with a smaller one.
-		return renderAndChunk(value, byteLimit, runeLimit/2)
+	appendText := func(text string) {
+		for _, r := range text {
+			appendHTML(html.EscapeString(string(r)))
+		}
 	}
-	result := make([]string, 0, len(chunks))
-	for _, chunk := range chunks {
-		result = append(result, renderAndChunk(chunk, byteLimit, runeLimit)...)
+	appendLink := func(label, url string) {
+		rendered := renderLink(label, url)
+		if len(rendered) <= byteLimit {
+			appendHTML(rendered)
+			return
+		}
+		prefix := `<a href="` + html.EscapeString(url) + `">`
+		const suffix = "</a>"
+		budget := byteLimit - len(prefix) - len(suffix)
+		// Ensure every escaped rune fits before emitting any fragments.
+		for _, r := range label {
+			if len(html.EscapeString(string(r))) > budget {
+				appendText(linkPlainText(label, url))
+				return
+			}
+		}
+		if budget <= 0 {
+			appendText(linkPlainText(label, url))
+			return
+		}
+		var part strings.Builder
+		for _, r := range label {
+			escaped := html.EscapeString(string(r))
+			if part.Len()+len(escaped) > budget {
+				appendHTML(prefix + part.String() + suffix)
+				part.Reset()
+			}
+			part.WriteString(escaped)
+		}
+		if part.Len() > 0 {
+			appendHTML(prefix + part.String() + suffix)
+		}
 	}
-	return result
+	appendPlain := func(text string) {
+		last := 0
+		for _, match := range urlPattern.FindAllStringSubmatchIndex(text, -1) {
+			appendText(text[last:match[0]])
+			start, end := match[2], match[3]
+			if start < 0 {
+				start, end = match[4], match[5]
+			}
+			url := text[start:end]
+			appendLink(url, url)
+			last = match[1]
+		}
+		appendText(text[last:])
+	}
+	last := 0
+	for _, match := range linkTokenPattern.FindAllStringSubmatchIndex(value, -1) {
+		appendPlain(value[last:match[0]])
+		label, labelErr := decodeLinkComponent(value[match[2]:match[3]])
+		url, urlErr := decodeLinkComponent(value[match[4]:match[5]])
+		if labelErr != nil || urlErr != nil {
+			appendText(SanitizeLinkTokenDelimiters(value[match[0]:match[1]]))
+		} else {
+			appendLink(label, url)
+		}
+		last = match[1]
+	}
+	appendPlain(value[last:])
+	flush()
+	if len(chunks) == 0 {
+		return []string{""}
+	}
+	return chunks
 }

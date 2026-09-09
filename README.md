@@ -73,3 +73,11 @@ go test ./...
 - `/help`
 
 Unauthorized Telegram users are ignored and logged.
+
+Login links are sent only in private chat. Start a private chat with the bot before using `/login` from a group. Starting a new login invalidates earlier links; `/logout` invalidates pending links even if no account is connected.
+
+`/logout` removes the local connection even if Google token revocation fails. In that case, the bot asks you to revoke access manually at https://myaccount.google.com/connections. Work already in progress may still complete.
+
+Large mail backlogs are processed across polls without advancing past unfinished history. Expanded message bodies are capped at 50,000 internal-text runes, with a truncation notice; link tokens are never cut in half. Oversized links may be shown as plain text.
+
+SQLite database files and existing WAL/shared-memory sidecars must allow owner-only permissions (`0600`); startup fails if these permissions cannot be enforced. Newly created database directories use `0700`. No new environment variables are required.
