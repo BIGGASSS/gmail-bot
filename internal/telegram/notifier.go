@@ -68,31 +68,28 @@ func (n *Notifier) SendReloginRequired(ctx context.Context, chatID int64, gmailE
 
 func (n *Notifier) SendMailNotification(ctx context.Context, chatID int64, mail models.IncomingMail) (SentMessage, error) {
 	_ = ctx
-	chunks := formatting.RenderAndChunk(formatting.FormatMailNotification(mail), formatting.SafeByteLimit)
-	if len(chunks) == 0 {
-		return SentMessage{}, nil
+	preview := formatting.FormatMailNotification(mail)
+	chunks := formatting.RenderAndChunk(preview, formatting.SafeByteLimit)
+	text := chunks[0]
+	if len(chunks) > 1 {
+		const notice = "\n… (preview truncated; tap Expand)"
+		// Re-render with room for the notice so entities and links stay intact.
+		chunks = formatting.RenderAndChunk(preview, formatting.SafeByteLimit-len(notice))
+		text = chunks[0] + notice
 	}
 	keyboard := tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("Expand", BuildExpandCallbackData(mail.GmailMessageID, 0)),
 		),
 	)
-	msg := tgbotapi.NewMessage(chatID, chunks[0])
+	msg := tgbotapi.NewMessage(chatID, text)
 	msg.ParseMode = "HTML"
 	msg.ReplyMarkup = keyboard
 	sent, err := n.bot.Send(msg)
 	if err != nil {
 		return SentMessage{}, NormalizeAPIError(err)
 	}
-	firstSent := SentMessage{ChatID: sent.Chat.ID, MessageID: sent.MessageID}
-	for _, chunk := range chunks[1:] {
-		extra := tgbotapi.NewMessage(chatID, chunk)
-		extra.ParseMode = "HTML"
-		if _, err := n.bot.Send(extra); err != nil {
-			return firstSent, NormalizeAPIError(err)
-		}
-	}
-	return firstSent, nil
+	return SentMessage{ChatID: sent.Chat.ID, MessageID: sent.MessageID}, nil
 }
 
 func (n *Notifier) SendExpandedMail(ctx context.Context, chatID int64, mail models.ExpandedMail) error {
