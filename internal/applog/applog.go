@@ -1,8 +1,11 @@
 package applog
 
 import (
+	"errors"
 	"fmt"
 	"log"
+	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 )
@@ -66,9 +69,54 @@ func Warningf(format string, args ...any) {
 }
 func Errorf(format string, args ...any) { logf(LevelError, "ERROR", format, args...) }
 
+var (
+	botTokenPattern   = regexp.MustCompile(`bot\d+:[A-Za-z0-9_-]+`)
+	urlPattern        = regexp.MustCompile(`https?://[^\s"'<>]+`)
+	credentialPattern = regexp.MustCompile(`(?i)((?:access_token|refresh_token|client_secret|token|code|state)["']?\s*[:=]\s*["']?)[^\s"'&,}]+`)
+)
+
+// RedactString sanitizes URLs and labeled credentials before any log output.
+// Entire query strings are removed: OAuth callback URLs can contain secrets.
+func RedactString(s string) string {
+	s = urlPattern.ReplaceAllStringFunc(s, func(raw string) string {
+		u, err := url.Parse(raw)
+		if err != nil {
+			return "[redacted URL]"
+		}
+		u.User = nil
+		u.RawQuery = ""
+		u.ForceQuery = false
+		u.Fragment = ""
+		return u.String()
+	})
+	s = botTokenPattern.ReplaceAllString(s, "bot***")
+	return credentialPattern.ReplaceAllString(s, "${1}[redacted]")
+}
+
+// RedactError renders err for logging without leaking credentials: URLs in
+// *url.Error (which may embed bot or OAuth tokens) are dropped, and any
+// remaining bot-token patterns are redacted.
+func RedactError(err error) string {
+	if err == nil {
+		return ""
+	}
+	var urlErr *url.Error
+	msg := err.Error()
+	if errors.As(err, &urlErr) {
+		msg = urlErr.Op + ": " + urlErr.Err.Error()
+	}
+	return RedactString(msg)
+}
+
 func logf(level Level, name, format string, args ...any) {
 	if level < CurrentLevel() {
 		return
 	}
-	log.Printf("%s %s", name, fmt.Sprintf(format, args...))
+	safeArgs := append([]any(nil), args...)
+	for i, arg := range safeArgs {
+		if err, ok := arg.(error); ok {
+			safeArgs[i] = RedactError(err)
+		}
+	}
+	log.Printf("%s %s", name, RedactString(fmt.Sprintf(format, safeArgs...)))
 }

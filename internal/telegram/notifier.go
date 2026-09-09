@@ -30,8 +30,8 @@ func NewNotifier(bot BotAPI) *Notifier {
 
 func (n *Notifier) SendText(ctx context.Context, chatID int64, text string) error {
 	_ = ctx
-	for _, chunk := range formatting.ChunkText(text, formatting.SafeMessageChunk) {
-		msg := tgbotapi.NewMessage(chatID, formatting.RenderTelegramHTML(chunk))
+	for _, chunk := range formatting.RenderAndChunk(text, formatting.SafeByteLimit) {
+		msg := tgbotapi.NewMessage(chatID, chunk)
 		msg.ParseMode = "HTML"
 		if _, err := n.bot.Send(msg); err != nil {
 			return NormalizeAPIError(err)
@@ -68,12 +68,21 @@ func (n *Notifier) SendReloginRequired(ctx context.Context, chatID int64, gmailE
 
 func (n *Notifier) SendMailNotification(ctx context.Context, chatID int64, mail models.IncomingMail) (SentMessage, error) {
 	_ = ctx
+	preview := formatting.FormatMailNotification(mail)
+	chunks := formatting.RenderAndChunk(preview, formatting.SafeByteLimit)
+	text := chunks[0]
+	if len(chunks) > 1 {
+		const notice = "\n… (preview truncated; tap Expand)"
+		// Re-render with room for the notice so entities and links stay intact.
+		chunks = formatting.RenderAndChunk(preview, formatting.SafeByteLimit-len(notice))
+		text = chunks[0] + notice
+	}
 	keyboard := tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("Expand", BuildExpandCallbackData(mail.GmailMessageID, 0)),
 		),
 	)
-	msg := tgbotapi.NewMessage(chatID, formatting.RenderTelegramHTML(formatting.FormatMailNotification(mail)))
+	msg := tgbotapi.NewMessage(chatID, text)
 	msg.ParseMode = "HTML"
 	msg.ReplyMarkup = keyboard
 	sent, err := n.bot.Send(msg)
@@ -85,8 +94,8 @@ func (n *Notifier) SendMailNotification(ctx context.Context, chatID int64, mail 
 
 func (n *Notifier) SendExpandedMail(ctx context.Context, chatID int64, mail models.ExpandedMail) error {
 	_ = ctx
-	for _, chunk := range formatting.ChunkText(formatting.FormatExpandedMail(mail), formatting.SafeMessageChunk) {
-		msg := tgbotapi.NewMessage(chatID, formatting.RenderTelegramHTML(chunk))
+	for _, chunk := range formatting.RenderAndChunk(formatting.FormatExpandedMail(mail), formatting.SafeByteLimit) {
+		msg := tgbotapi.NewMessage(chatID, chunk)
 		msg.ParseMode = "HTML"
 		if _, err := n.bot.Send(msg); err != nil {
 			return NormalizeAPIError(err)
@@ -97,14 +106,14 @@ func (n *Notifier) SendExpandedMail(ctx context.Context, chatID int64, mail mode
 
 func (n *Notifier) EditExpandedMail(ctx context.Context, chatID int64, messageID int, mail models.ExpandedMail, pageIndex int) error {
 	_ = ctx
-	chunks := formatting.ChunkText(formatting.FormatExpandedMail(mail), formatting.SafeMessageChunk)
+	chunks := formatting.RenderAndChunk(formatting.FormatExpandedMail(mail), formatting.SafeByteLimit)
 	if pageIndex < 0 {
 		pageIndex = 0
 	}
 	if pageIndex >= len(chunks) {
 		pageIndex = len(chunks) - 1
 	}
-	edit := tgbotapi.NewEditMessageText(chatID, messageID, formatting.RenderTelegramHTML(chunks[pageIndex]))
+	edit := tgbotapi.NewEditMessageText(chatID, messageID, chunks[pageIndex])
 	edit.ParseMode = "HTML"
 	if keyboard := buildExpandedPageKeyboard(mail.GmailMessageID, len(chunks)); keyboard != nil {
 		edit.ReplyMarkup = keyboard

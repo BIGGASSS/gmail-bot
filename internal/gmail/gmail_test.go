@@ -38,6 +38,65 @@ func TestExtractBodyAndAttachmentsPrefersPlainText(t *testing.T) {
 	}
 }
 
+func TestExtractBodyAndAttachmentsTruncatesLargeBody(t *testing.T) {
+	large := strings.Repeat("x", 100000)
+	body, attachments := ExtractBodyAndAttachments(map[string]any{
+		"mimeType": "text/plain",
+		"body":     map[string]any{"data": encodeBody(large)},
+	})
+	if len(attachments) != 0 {
+		t.Fatalf("expected no attachments, got %+v", attachments)
+	}
+	if !strings.Contains(body, "\u2026 (message truncated)") {
+		t.Fatalf("missing truncation marker")
+	}
+	runes := len([]rune(body))
+	if runes > 50000+len([]rune("\n\u2026 (message truncated)")) {
+		t.Fatalf("body not capped: %d runes", runes)
+	}
+}
+
+func TestExtractBodyAndAttachmentsTruncatesInsideHTMLAnchor(t *testing.T) {
+	for _, prefix := range []string{"", strings.Repeat("x", 49990)} {
+		label := strings.Repeat("世界 &amp; ", 15000)
+		body, _ := ExtractBodyAndAttachments(map[string]any{
+			"mimeType": "text/html",
+			"body":     map[string]any{"data": encodeBody(prefix + `<a href="https://example.com">` + label + `</a>`)},
+		})
+		const marker = "\n… (message truncated)"
+		if !strings.HasSuffix(body, marker) || len([]rune(body)) > 50000+len([]rune(marker)) {
+			t.Fatal("body not capped with truncation marker")
+		}
+		if strings.ContainsAny(body, "\ufff0\ufff1\ufff2") {
+			t.Fatal("partial encoded token survived body truncation")
+		}
+		if !strings.HasPrefix(body, prefix+"世界 &") {
+			t.Fatal("truncated anchor lost decoded label")
+		}
+		for _, chunk := range formatting.RenderAndChunk(body, formatting.SafeByteLimit) {
+			if len(chunk) > formatting.SafeByteLimit || strings.ContainsAny(chunk, "\ufff0\ufff1\ufff2") {
+				t.Fatal("invalid rendered truncated body")
+			}
+		}
+	}
+}
+
+func TestExtractBodyAndAttachmentsSanitizesPlainText(t *testing.T) {
+	forged := "see \ufff0aHR0cHM6Ly9ldmlsLmV4YW1wbGUuY29t\ufff1Q2xpY2sgaGVyZQ\ufff2 now"
+	body, attachments := ExtractBodyAndAttachments(map[string]any{
+		"mimeType": "text/plain",
+		"body":     map[string]any{"data": encodeBody(forged)},
+	})
+	if len(attachments) != 0 {
+		t.Fatalf("expected no attachments, got %+v", attachments)
+	}
+	for _, delimiter := range []string{"\ufff0", "\ufff1", "\ufff2"} {
+		if strings.Contains(body, delimiter) {
+			t.Fatalf("body contains forged delimiter %q: %q", delimiter, body)
+		}
+	}
+}
+
 func TestExtractBodyAndAttachmentsKeepsHTMLAnchorTextClickable(t *testing.T) {
 	body, attachments := ExtractBodyAndAttachments(map[string]any{
 		"mimeType": "text/html",

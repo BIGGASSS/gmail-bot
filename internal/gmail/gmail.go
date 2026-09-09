@@ -23,6 +23,11 @@ import (
 
 const APIBase = "https://gmail.googleapis.com/gmail/v1/users/me"
 
+const (
+	maxHistoryPages    = 10
+	maxMessagesPerPoll = 50
+)
+
 type Profile struct {
 	EmailAddress string
 	HistoryID    string
@@ -91,8 +96,22 @@ func (s *Service) ListNewInboxMessages(ctx context.Context, account models.Googl
 	latestHistoryID := account.LastHistoryID
 	var pageToken string
 	messageIDs := make(map[string]struct{})
+	var incoming []models.IncomingMail
+	metadataRequests := 0
+	finish := func() ([]models.IncomingMail, string, error) {
+		sort.SliceStable(incoming, func(i, j int) bool {
+			return incoming[i].ReceivedAt.Before(incoming[j].ReceivedAt)
+		})
+		return incoming, latestHistoryID, nil
+	}
 
+	pages := 0
 	for {
+		pages++
+		if pages > maxHistoryPages {
+			applog.Warningf("Gmail history fanout cap reached for Telegram user %d: processed %d pages.", account.TelegramUserID, maxHistoryPages)
+			break
+		}
 		params := url.Values{}
 		params.Set("startHistoryId", account.LastHistoryID)
 		params.Set("historyTypes", "messageAdded")
@@ -113,18 +132,18 @@ func (s *Service) ListNewInboxMessages(ctx context.Context, account models.Googl
 			return nil, "", err
 		}
 
-		if historyID, ok := anyString(payload["historyId"]); ok {
-			latestHistoryID = historyID
-		}
-
 		if history, ok := payload["history"].([]any); ok {
 			for _, entry := range history {
 				entryMap, ok := entry.(map[string]any)
 				if !ok {
 					continue
 				}
-				if id, ok := anyString(entryMap["id"]); ok {
-					latestHistoryID = id
+				// Bound metadata work at record boundaries, including filtered mail.
+				// A single large record may exceed this soft request budget: filtered
+				// messages have no durable delivery mark, so stopping midway on that
+				// budget alone could replay them forever.
+				if metadataRequests >= maxMessagesPerPoll {
+					return finish()
 				}
 				messagesAdded, _ := entryMap["messagesAdded"].([]any)
 				for _, item := range messagesAdded {
@@ -133,46 +152,56 @@ func (s *Service) ListNewInboxMessages(ctx context.Context, account models.Googl
 						continue
 					}
 					message, _ := itemMap["message"].(map[string]any)
-					if messageID, ok := anyString(message["id"]); ok && messageID != "" {
-						messageIDs[messageID] = struct{}{}
+					messageID, ok := anyString(message["id"])
+					if !ok || messageID == "" {
+						continue
 					}
+					if _, seen := messageIDs[messageID]; seen {
+						continue
+					}
+					messageIDs[messageID] = struct{}{}
+					delivered, err := s.database.WasMessageDelivered(ctx, account.TelegramUserID, messageID)
+					if err != nil {
+						return nil, "", err
+					}
+					if delivered {
+						continue
+					}
+					if len(incoming) >= maxMessagesPerPoll {
+						// Keep the previous record's cursor. On the next poll,
+						// delivery marks let us resume this partially handled record.
+						return finish()
+					}
+					metadataRequests++
+					summary, err := s.GetMessageSummary(ctx, account, messageID)
+					if err != nil {
+						return nil, "", err
+					}
+					if summary != nil && summary.ReceivedAt.After(account.ConnectedAt) {
+						incoming = append(incoming, *summary)
+					}
+				}
+				if id, ok := anyString(entryMap["id"]); ok && id != "" {
+					latestHistoryID = id
 				}
 			}
 		}
 
 		next, _ := payload["nextPageToken"].(string)
 		if next == "" {
+			// The mailbox-wide cursor is safe only after exhausting history.
+			if id, ok := anyString(payload["historyId"]); ok && id != "" {
+				latestHistoryID = id
+			}
 			break
+		}
+		if metadataRequests >= maxMessagesPerPoll {
+			return finish()
 		}
 		pageToken = next
 	}
 
-	var incoming []models.IncomingMail
-	for messageID := range messageIDs {
-		delivered, err := s.database.WasMessageDelivered(ctx, account.TelegramUserID, messageID)
-		if err != nil {
-			return nil, "", err
-		}
-		if delivered {
-			continue
-		}
-		summary, err := s.GetMessageSummary(ctx, account, messageID)
-		if err != nil {
-			return nil, "", err
-		}
-		if summary == nil {
-			continue
-		}
-		if !summary.ReceivedAt.After(account.ConnectedAt) {
-			continue
-		}
-		incoming = append(incoming, *summary)
-	}
-
-	sort.Slice(incoming, func(i, j int) bool {
-		return incoming[i].ReceivedAt.Before(incoming[j].ReceivedAt)
-	})
-	return incoming, latestHistoryID, nil
+	return finish()
 }
 
 func (s *Service) GetMessageSummary(ctx context.Context, account models.GoogleAccount, messageID string) (*models.IncomingMail, error) {
@@ -469,7 +498,7 @@ func ExtractBodyAndAttachments(payload map[string]any) (string, []models.Attachm
 		}
 
 		if mimeType == "text/plain" && data != "" {
-			plainParts = append(plainParts, decodeBodyData(data))
+			plainParts = append(plainParts, formatting.SanitizeLinkTokenDelimiters(decodeBodyData(data)))
 		} else if mimeType == "text/html" && data != "" {
 			htmlParts = append(htmlParts, formatting.HTMLToTelegramText(decodeBodyData(data)))
 		}
@@ -502,6 +531,11 @@ func ExtractBodyAndAttachments(payload map[string]any) (string, []models.Attachm
 			}
 		}
 		bodyText = strings.Join(bodyPieces, "\n\n")
+	}
+
+	const maxBodyTextRunes = 50000
+	if len([]rune(bodyText)) > maxBodyTextRunes {
+		bodyText = formatting.TruncateText(bodyText, maxBodyTextRunes) + "\n\u2026 (message truncated)"
 	}
 	return bodyText, attachments
 }

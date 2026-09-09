@@ -23,12 +23,17 @@ import (
 func main() {
 	if err := run(); err != nil {
 		if settingsErr, ok := err.(*config.SettingsError); ok {
-			fmt.Fprintf(os.Stderr, "Configuration error: %s\n", settingsErr.Error())
+			fmt.Fprintf(os.Stderr, "Configuration error: %s\n", applog.RedactError(settingsErr))
 			os.Exit(1)
 		}
-		fmt.Fprintf(os.Stderr, "Fatal error: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Fatal error: %s\n", applog.RedactError(err))
 		os.Exit(1)
 	}
+}
+
+// Leave headroom beyond Telegram's 30-second server-side long poll.
+func newTelegramHTTPClient() *http.Client {
+	return &http.Client{Timeout: 60 * time.Second}
 }
 
 func run() error {
@@ -61,7 +66,7 @@ func run() error {
 	oauthClient := oauth.NewClient(settings, httpClient)
 	gmailService := gmail.NewService(httpClient, oauthClient, db)
 
-	api, err := tgbotapi.NewBotAPI(settings.TelegramBotToken)
+	api, err := tgbotapi.NewBotAPIWithClient(settings.TelegramBotToken, tgbotapi.APIEndpoint, newTelegramHTTPClient())
 	if err != nil {
 		return fmt.Errorf("create telegram bot: %w", err)
 	}

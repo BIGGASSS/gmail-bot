@@ -2,10 +2,14 @@ package telegram
 
 import (
 	"context"
+	"encoding/xml"
+	"io"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
+	"github.com/BIGGASSS/gmail-bot/internal/formatting"
 	"github.com/BIGGASSS/gmail-bot/internal/models"
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
@@ -26,6 +30,81 @@ func (f *fakeBot) Send(c tgbotapi.Chattable) (tgbotapi.Message, error) {
 
 func (f *fakeBot) Request(c tgbotapi.Chattable) (*tgbotapi.APIResponse, error) {
 	return &tgbotapi.APIResponse{Ok: true}, nil
+}
+
+func TestSendMailNotificationTruncatesOversizedContent(t *testing.T) {
+	for _, content := range []string{
+		strings.Repeat("A", 5000),
+		strings.Repeat("<&😀", 1500),
+		strings.Repeat("https://example.com/path ", 300),
+	} {
+		t.Run(content[:8], func(t *testing.T) {
+			testSingleNotification(t, content, true)
+		})
+	}
+}
+
+func TestSendMailNotificationPreservesShortPreview(t *testing.T) {
+	testSingleNotification(t, "Hello <there> 😀", false)
+}
+
+func testSingleNotification(t *testing.T, content string, truncated bool) {
+	t.Helper()
+	bot := &fakeBot{}
+	notifier := NewNotifier(bot)
+	mail := models.IncomingMail{
+		GmailMessageID: "gmail-message-1",
+		FromHeader:     "sender@example.com",
+		Subject:        content,
+		Snippet:        "snippet",
+		ReceivedAt:     time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC),
+	}
+
+	sent, err := notifier.SendMailNotification(context.Background(), 456, mail)
+	if err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	if sent.ChatID != 456 || sent.MessageID != 1 {
+		t.Fatalf("unexpected delivery reference: %+v", sent)
+	}
+	if len(bot.sent) != 1 {
+		t.Fatalf("expected one preview message, got %d", len(bot.sent))
+	}
+	first, ok := bot.sent[0].chattable.(tgbotapi.MessageConfig)
+	if !ok {
+		t.Fatalf("expected MessageConfig, got %T", bot.sent[0].chattable)
+	}
+	if first.ReplyMarkup == nil {
+		t.Fatal("expected Expand keyboard on first chunk")
+	}
+	markup, ok := first.ReplyMarkup.(tgbotapi.InlineKeyboardMarkup)
+	if !ok {
+		t.Fatalf("unexpected markup type %T", first.ReplyMarkup)
+	}
+	if len(markup.InlineKeyboard) != 1 || len(markup.InlineKeyboard[0]) != 1 || markup.InlineKeyboard[0][0].Text != "Expand" {
+		t.Fatalf("unexpected keyboard: %+v", markup.InlineKeyboard)
+	}
+	if first.ParseMode != "HTML" || len(first.Text) > formatting.SafeByteLimit || !utf8.ValidString(first.Text) {
+		t.Fatalf("invalid preview: mode=%q bytes=%d", first.ParseMode, len(first.Text))
+	}
+	if truncated {
+		if !strings.HasSuffix(first.Text, "\n… (preview truncated; tap Expand)") {
+			t.Fatal("missing truncation notice")
+		}
+	} else if want := formatting.RenderTelegramHTML(formatting.FormatMailNotification(mail)); first.Text != want {
+		t.Fatalf("short preview changed: got %q, want %q", first.Text, want)
+	}
+	if data := markup.InlineKeyboard[0][0].CallbackData; data == nil || *data != "expand:gmail-message-1" {
+		t.Fatalf("unexpected Expand callback: %v", data)
+	}
+	decoder := xml.NewDecoder(strings.NewReader("<root>" + first.Text + "</root>"))
+	for {
+		if _, err := decoder.Token(); err == io.EOF {
+			break
+		} else if err != nil {
+			t.Fatalf("preview contains broken HTML: %v", err)
+		}
+	}
 }
 
 func TestEditExpandedMailEditsOriginalMessageAndRemovesButton(t *testing.T) {

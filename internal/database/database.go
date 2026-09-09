@@ -17,8 +17,24 @@ type Database struct {
 }
 
 func Open(databasePath string) (*Database, error) {
-	if err := os.MkdirAll(filepath.Dir(databasePath), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(databasePath), 0o700); err != nil {
 		return nil, fmt.Errorf("create database directory: %w", err)
+	}
+
+	if _, err := os.Stat(databasePath); os.IsNotExist(err) {
+		f, err := os.OpenFile(databasePath, os.O_CREATE|os.O_WRONLY, 0o600)
+		if err != nil {
+			return nil, fmt.Errorf("create database file: %w", err)
+		}
+		if err := f.Close(); err != nil {
+			return nil, fmt.Errorf("close database file: %w", err)
+		}
+	} else if err != nil {
+		return nil, fmt.Errorf("stat database file: %w", err)
+	}
+	// Restrict existing files before SQLite reads secrets or creates sidecars.
+	if err := restrictDBPermissions(databasePath); err != nil {
+		return nil, err
 	}
 
 	db, err := sql.Open("sqlite", databasePath)
@@ -38,7 +54,25 @@ func Open(databasePath string) (*Database, error) {
 		return nil, fmt.Errorf("enable foreign keys: %w", err)
 	}
 
+	if err := restrictDBPermissions(databasePath); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+
 	return &Database{db: db}, nil
+}
+
+func restrictDBPermissions(databasePath string) error {
+	for i, f := range []string{databasePath, databasePath + "-wal", databasePath + "-shm"} {
+		if err := os.Chmod(f, 0o600); err != nil {
+			// SQLite creates sidecars lazily; only those may be absent.
+			if i > 0 && os.IsNotExist(err) {
+				continue
+			}
+			return fmt.Errorf("restrict database permissions for %s: %w", f, err)
+		}
+	}
+	return nil
 }
 
 func (d *Database) Close() error {
@@ -351,6 +385,11 @@ WHERE state = ?
 		return nil, nil
 	}
 	return oauthState, nil
+}
+
+func (d *Database) DeleteOAuthStatesForUser(ctx context.Context, telegramUserID int64) error {
+	_, err := d.db.ExecContext(ctx, `DELETE FROM oauth_states WHERE telegram_user_id = ?`, telegramUserID)
+	return err
 }
 
 func (d *Database) CleanupExpiredOAuthStates(ctx context.Context) error {

@@ -16,9 +16,13 @@ import (
 const (
 	TelegramMessageLimit = 4096
 	SafeMessageChunk     = 3500
-	linkTokenStart       = "\ufff0"
-	linkTokenSeparator   = "\ufff1"
-	linkTokenEnd         = "\ufff2"
+	// SafeByteLimit is a byte budget for rendered HTML. Telegram's limit is
+	// 4096 UTF-16 code units. Valid UTF-8 text uses at least as many bytes
+	// as UTF-16 code units, so 3900 rendered bytes is a conservative limit.
+	SafeByteLimit      = 3900
+	linkTokenStart     = "\ufff0"
+	linkTokenSeparator = "\ufff1"
+	linkTokenEnd       = "\ufff2"
 )
 
 var (
@@ -35,6 +39,16 @@ var (
 	}
 )
 
+// SanitizeLinkTokenDelimiters strips the private-use Unicode delimiters
+// used as internal link tokens from untrusted text, preventing forged
+// Telegram anchor tags.
+func SanitizeLinkTokenDelimiters(value string) string {
+	value = strings.ReplaceAll(value, linkTokenStart, "")
+	value = strings.ReplaceAll(value, linkTokenSeparator, "")
+	value = strings.ReplaceAll(value, linkTokenEnd, "")
+	return value
+}
+
 func NormalizeWhitespace(value string) string {
 	rawLines := strings.Split(value, "\n")
 	lines := make([]string, 0, len(rawLines))
@@ -48,7 +62,7 @@ func NormalizeWhitespace(value string) string {
 }
 
 func NormalizeGmailSnippet(value string) string {
-	return NormalizeWhitespace(html.UnescapeString(value))
+	return NormalizeWhitespace(SanitizeLinkTokenDelimiters(html.UnescapeString(value)))
 }
 
 func encodeLinkComponent(value string) string {
@@ -191,7 +205,7 @@ func extractHTMLText(value string, preserveAnchorTextLinks bool) string {
 		case nethtml.ErrorToken:
 			return strings.Join(parts, "")
 		case nethtml.TextToken:
-			parts = append(parts, string(tokenizer.Text()))
+			parts = append(parts, SanitizeLinkTokenDelimiters(string(tokenizer.Text())))
 		case nethtml.StartTagToken:
 			nameBytes, hasAttr := tokenizer.TagName()
 			tag := string(nameBytes)
@@ -236,10 +250,12 @@ func FormatMailNotification(mail models.IncomingMail) string {
 	if from == "" {
 		from = "Unknown sender"
 	}
+	from = SanitizeLinkTokenDelimiters(from)
 	subject := mail.Subject
 	if subject == "" {
 		subject = "(no subject)"
 	}
+	subject = SanitizeLinkTokenDelimiters(subject)
 	snippet := mail.Snippet
 	if snippet == "" {
 		snippet = "(no preview available)"
@@ -263,10 +279,12 @@ func FormatExpandedMail(mail models.ExpandedMail) string {
 	if from == "" {
 		from = "Unknown sender"
 	}
+	from = SanitizeLinkTokenDelimiters(from)
 	subject := mail.Subject
 	if subject == "" {
 		subject = "(no subject)"
 	}
+	subject = SanitizeLinkTokenDelimiters(subject)
 	lines := []string{
 		"Expanded Gmail message",
 		"From: " + from,
@@ -298,35 +316,24 @@ func FormatAttachmentLines(attachments []models.AttachmentMeta) []string {
 		if mimeType == "" {
 			mimeType = "application/octet-stream"
 		}
-		lines = append(lines, fmt.Sprintf("- %s [%s, %s]", name, mimeType, sizeSuffix))
+		lines = append(lines, fmt.Sprintf("- %s [%s, %s]",
+			SanitizeLinkTokenDelimiters(name), SanitizeLinkTokenDelimiters(mimeType), sizeSuffix))
 	}
 	return lines
 }
 
-func runeLen(value string) int {
-	return len([]rune(value))
-}
-
-func runeSlice(value string, start, end int) string {
-	runes := []rune(value)
-	if start < 0 {
-		start = 0
-	}
-	if end > len(runes) {
-		end = len(runes)
-	}
-	if start >= end {
-		return ""
-	}
-	return string(runes[start:end])
-}
-
-func safeSplitAt(value string, splitAt int) int {
-	runes := []rune(value)
+// safeSplitAtRunes adjusts splitAt so it does not fall inside a link token
+// within runes[start:splitAt]. If the split lands inside a token, the split
+// is moved to just before the token start.
+func safeSplitAtRunes(runes []rune, start, splitAt int) int {
 	if splitAt > len(runes) {
 		splitAt = len(runes)
 	}
-	prefix := string(runes[:splitAt])
+	if splitAt <= start {
+		return splitAt
+	}
+	// Check if we're inside a link token by searching backwards for linkTokenStart.
+	prefix := string(runes[start:splitAt])
 	tokenStart := strings.LastIndex(prefix, linkTokenStart)
 	if tokenStart == -1 {
 		return splitAt
@@ -335,44 +342,192 @@ func safeSplitAt(value string, splitAt int) int {
 	if tokenEnd > tokenStart {
 		return splitAt
 	}
-	// Convert byte index of tokenStart within prefix to rune index.
+	// Inside a link token — move split to before the token start.
 	startRune := len([]rune(prefix[:tokenStart]))
 	if startRune == 0 {
 		return splitAt
 	}
-	return startRune
+	return start + startRune
 }
 
 func ChunkText(value string, limit int) []string {
 	if limit <= 0 {
 		limit = SafeMessageChunk
 	}
-	if runeLen(value) <= limit {
+	runes := []rune(value)
+	if len(runes) <= limit {
 		return []string{value}
 	}
 
 	var chunks []string
-	remaining := value
-	for remaining != "" {
-		if runeLen(remaining) <= limit {
-			chunks = append(chunks, remaining)
+	start := 0
+	for start < len(runes) {
+		if len(runes)-start <= limit {
+			chunks = append(chunks, string(runes[start:]))
 			break
 		}
 
-		prefix := runeSlice(remaining, 0, limit)
-		splitAt := strings.LastIndex(prefix, "\n")
-		if splitAt <= 0 {
-			splitAt = limit
-		} else {
-			// LastIndex returns byte index within prefix; convert to rune index of remaining.
-			splitAt = len([]rune(prefix[:splitAt]))
+		end := start + limit
+		// Find last newline in runes[start:end].
+		splitAt := end
+		for i := end - 1; i >= start; i-- {
+			if runes[i] == '\n' {
+				splitAt = i
+				break
+			}
 		}
-		splitAt = safeSplitAt(remaining, splitAt)
+		if splitAt <= start {
+			splitAt = end
+		}
+		// Avoid splitting inside a link token.
+		splitAt = safeSplitAtRunes(runes, start, splitAt)
+		// Trim trailing whitespace from the chunk.
+		chunkEnd := splitAt
+		for chunkEnd > start && unicode.IsSpace(runes[chunkEnd-1]) {
+			chunkEnd--
+		}
+		if chunkEnd > start {
+			chunks = append(chunks, string(runes[start:chunkEnd]))
+		}
+		// Skip leading newlines of the next chunk.
+		start = splitAt
+		for start < len(runes) && runes[start] == '\n' {
+			start++
+		}
+	}
+	return chunks
+}
 
-		chunk := strings.TrimRightFunc(runeSlice(remaining, 0, splitAt), unicode.IsSpace)
-		chunks = append(chunks, chunk)
-		rest := runeSlice(remaining, splitAt, runeLen(remaining))
-		remaining = strings.TrimLeft(rest, "\n")
+// TruncateText caps the internal representation at limit runes without cutting
+// an encoded link token. A link crossing the cutoff falls back to decoded text.
+func TruncateText(value string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	runes := []rune(value)
+	if len(runes) <= limit {
+		return value
+	}
+	cutoff := len(string(runes[:limit]))
+	for _, match := range linkTokenPattern.FindAllStringSubmatchIndex(value, -1) {
+		if match[0] >= cutoff {
+			break
+		}
+		if match[1] > cutoff {
+			label, _ := decodeLinkComponent(value[match[2]:match[3]])
+			url, _ := decodeLinkComponent(value[match[4]:match[5]])
+			plain := []rune(SanitizeLinkTokenDelimiters(linkPlainText(label, url)))
+			remaining := limit - len([]rune(value[:match[0]]))
+			if len(plain) > remaining {
+				plain = plain[:remaining]
+			}
+			return value[:match[0]] + string(plain)
+		}
+	}
+	return string(runes[:limit])
+}
+
+func linkPlainText(label, url string) string {
+	if label == url {
+		return label
+	}
+	return label + " <" + url + ">"
+}
+
+// RenderAndChunk renders complete tokens before splitting decoded text. Long
+// labels repeat the original target on each fragment; targets too large for an
+// anchor fall back to plain label/URL text. HTML entities and UTF-8 runes remain
+// intact. Limits below 6 are raised to 6 (the longest escaped single rune).
+// Callers must NOT call RenderTelegramHTML on the returned chunks again.
+func RenderAndChunk(value string, byteLimit int) []string {
+	if byteLimit <= 0 {
+		byteLimit = SafeByteLimit
+	}
+	if byteLimit < 6 {
+		byteLimit = 6
+	}
+	var chunks []string
+	var current strings.Builder
+	flush := func() {
+		if current.Len() > 0 {
+			chunks = append(chunks, current.String())
+			current.Reset()
+		}
+	}
+	appendHTML := func(fragment string) {
+		if current.Len()+len(fragment) > byteLimit {
+			flush()
+		}
+		current.WriteString(fragment)
+	}
+	appendText := func(text string) {
+		for _, r := range text {
+			appendHTML(html.EscapeString(string(r)))
+		}
+	}
+	appendLink := func(label, url string) {
+		rendered := renderLink(label, url)
+		if len(rendered) <= byteLimit {
+			appendHTML(rendered)
+			return
+		}
+		prefix := `<a href="` + html.EscapeString(url) + `">`
+		const suffix = "</a>"
+		budget := byteLimit - len(prefix) - len(suffix)
+		// Ensure every escaped rune fits before emitting any fragments.
+		for _, r := range label {
+			if len(html.EscapeString(string(r))) > budget {
+				appendText(linkPlainText(label, url))
+				return
+			}
+		}
+		if budget <= 0 {
+			appendText(linkPlainText(label, url))
+			return
+		}
+		var part strings.Builder
+		for _, r := range label {
+			escaped := html.EscapeString(string(r))
+			if part.Len()+len(escaped) > budget {
+				appendHTML(prefix + part.String() + suffix)
+				part.Reset()
+			}
+			part.WriteString(escaped)
+		}
+		if part.Len() > 0 {
+			appendHTML(prefix + part.String() + suffix)
+		}
+	}
+	appendPlain := func(text string) {
+		last := 0
+		for _, match := range urlPattern.FindAllStringSubmatchIndex(text, -1) {
+			appendText(text[last:match[0]])
+			start, end := match[2], match[3]
+			if start < 0 {
+				start, end = match[4], match[5]
+			}
+			url := text[start:end]
+			appendLink(url, url)
+			last = match[1]
+		}
+		appendText(text[last:])
+	}
+	last := 0
+	for _, match := range linkTokenPattern.FindAllStringSubmatchIndex(value, -1) {
+		appendPlain(value[last:match[0]])
+		label, labelErr := decodeLinkComponent(value[match[2]:match[3]])
+		url, urlErr := decodeLinkComponent(value[match[4]:match[5]])
+		if labelErr != nil || urlErr != nil {
+			appendText(SanitizeLinkTokenDelimiters(value[match[0]:match[1]]))
+		} else {
+			appendLink(label, url)
+		}
+		last = match[1]
+	}
+	appendPlain(value[last:])
+	flush()
+	if len(chunks) == 0 {
+		return []string{""}
 	}
 	return chunks
 }

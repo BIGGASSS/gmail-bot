@@ -101,6 +101,33 @@ func TestCallbackGoogleError(t *testing.T) {
 	}
 }
 
+func TestCallbackErrorParamCapped(t *testing.T) {
+	server := newTestServer(t, nil, nil)
+	bigError := strings.Repeat("a", 100000)
+	req := httptest.NewRequest(http.MethodGet, "/oauth/google/callback?error="+bigError, nil)
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d", rec.Code)
+	}
+	if got := rec.Body.Len(); got >= 1024 {
+		t.Fatalf("body length=%d, want < 1024", got)
+	}
+	if !strings.Contains(rec.Body.String(), "Google login failed") {
+		t.Fatalf("body=%q", rec.Body.String())
+	}
+}
+
+func TestServerHasTimeouts(t *testing.T) {
+	server := newTestServer(t, nil, nil)
+	if server.httpServer.WriteTimeout == 0 {
+		t.Fatal("expected WriteTimeout to be set")
+	}
+	if server.httpServer.ReadTimeout == 0 {
+		t.Fatal("expected ReadTimeout to be set")
+	}
+}
+
 func newTestServer(t *testing.T, db *database.Database, notifier LoginNotifier) *Server {
 	t.Helper()
 	if db == nil {

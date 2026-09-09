@@ -9,9 +9,9 @@ import (
 type TelegramBotLogger struct{}
 
 func (TelegramBotLogger) Println(v ...any) {
-	Warningf("%s", fmt.Sprint(v...))
+	Warningf("%s", RedactString(fmt.Sprint(v...)))
 }
 
 func (TelegramBotLogger) Printf(format string, v ...any) {
-	Warningf(format, v...)
+	Warningf("%s", RedactString(fmt.Sprintf(format, v...)))
 }

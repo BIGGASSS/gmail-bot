@@ -85,3 +85,63 @@ func TestFormatExpandedMailIncludesAttachments(t *testing.T) {
 		t.Fatal("missing attachment name")
 	}
 }
+
+func TestSanitizeLinkTokenDelimitersPreventsForgery(t *testing.T) {
+	forged := "check this out " + EncodeLinkToken("click here", "https://evil.com")
+	sanitized := SanitizeLinkTokenDelimiters(forged)
+	rendered := RenderTelegramHTML(sanitized)
+	if strings.Contains(rendered, `<a href="https://evil.com"`) {
+		t.Fatalf("forged link token survived sanitization: %s", rendered)
+	}
+}
+
+func TestRenderAndChunkRespectsByteLimit(t *testing.T) {
+	text := strings.Repeat("&", 10000) // each & renders to &amp; (5 bytes)
+	chunks := RenderAndChunk(text, SafeByteLimit)
+	if len(chunks) <= 1 {
+		t.Fatal("expected multiple chunks")
+	}
+	var joined strings.Builder
+	for _, chunk := range chunks {
+		if len(chunk) > SafeByteLimit {
+			t.Fatalf("chunk exceeds byte limit: %d > %d", len(chunk), SafeByteLimit)
+		}
+		joined.WriteString(strings.ReplaceAll(chunk, "&amp;", "&"))
+	}
+	if joined.String() != text {
+		t.Fatalf("joined chunk text does not reproduce original: got %d chars, want %d", len(joined.String()), len(text))
+	}
+}
+
+func TestRenderAndChunkWithLinkTokens(t *testing.T) {
+	var b strings.Builder
+	for i := 0; i < 200; i++ {
+		b.WriteString(EncodeLinkToken("example link", "https://example.com/page"))
+		b.WriteString(" some plain text between links\n")
+	}
+	chunks := RenderAndChunk(b.String(), SafeByteLimit)
+	if len(chunks) <= 1 {
+		t.Fatal("expected multiple chunks")
+	}
+	for _, chunk := range chunks {
+		if len(chunk) > SafeByteLimit {
+			t.Fatalf("chunk exceeds byte limit: %d > %d", len(chunk), SafeByteLimit)
+		}
+		if strings.Count(chunk, "<a ") != strings.Count(chunk, "</a>") {
+			t.Fatalf("link token broken across chunks: %s", chunk)
+		}
+	}
+}
+
+func TestChunkTextPerformance(t *testing.T) {
+	text := strings.Repeat("line\n", 20000) // 100,000 runes
+	chunks := ChunkText(text, 1000)
+	if len(chunks) <= 1 {
+		t.Fatal("expected multiple chunks")
+	}
+	for _, chunk := range chunks {
+		if len([]rune(chunk)) > 1000 {
+			t.Fatalf("chunk too long: %d", len([]rune(chunk)))
+		}
+	}
+}
