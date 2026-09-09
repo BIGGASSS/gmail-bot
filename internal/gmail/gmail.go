@@ -345,6 +345,19 @@ func (s *Service) doAuthorized(ctx context.Context, method, rawURL string, param
 }
 
 func (s *Service) ensureValidAccessToken(ctx context.Context, account models.GoogleAccount) (models.GoogleAccount, error) {
+	if store, ok := s.database.(interface {
+		GetGoogleAccount(context.Context, int64) (*models.GoogleAccount, error)
+	}); ok {
+		current, err := store.GetGoogleAccount(ctx, account.TelegramUserID)
+		if err != nil {
+			return models.GoogleAccount{}, err
+		}
+		if current == nil || current.Generation != account.Generation {
+			return models.GoogleAccount{}, database.ErrStaleAuthorization
+		}
+		account.AccessToken, account.RefreshToken, account.TokenExpiry = current.AccessToken, current.RefreshToken, current.TokenExpiry
+	}
+
 	if account.TokenExpiry.After(time.Now().UTC()) {
 		return account, nil
 	}
@@ -360,7 +373,15 @@ func (s *Service) forceRefresh(ctx context.Context, account models.GoogleAccount
 	if tokens.RefreshToken != nil && *tokens.RefreshToken != "" {
 		refreshToken = *tokens.RefreshToken
 	}
-	if err := s.database.UpdateTokens(ctx, account.TelegramUserID, tokens.AccessToken, tokens.ExpiresAt, &refreshToken); err != nil {
+	var storeErr error
+	if guarded, ok := s.database.(interface {
+		UpdateTokensGuarded(context.Context, models.GoogleAccount, string, time.Time, *string) error
+	}); ok {
+		storeErr = guarded.UpdateTokensGuarded(ctx, account, tokens.AccessToken, tokens.ExpiresAt, &refreshToken)
+	} else {
+		storeErr = s.database.UpdateTokens(ctx, account.TelegramUserID, tokens.AccessToken, tokens.ExpiresAt, &refreshToken)
+	}
+	if err := storeErr; err != nil {
 		return models.GoogleAccount{}, err
 	}
 	account.AccessToken = tokens.AccessToken

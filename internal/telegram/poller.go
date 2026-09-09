@@ -158,6 +158,11 @@ func (p *GmailPoller) SendManualReloginPromptIfDue(ctx context.Context, account 
 		applog.Errorf("Failed to send manual Gmail reconnect prompt to Telegram user %d: %v", account.TelegramUserID, err)
 		return nil
 	}
+	if guarded, ok := p.database.(interface {
+		MarkReloginPromptSentGuarded(context.Context, models.GoogleAccount) error
+	}); ok {
+		return guarded.MarkReloginPromptSentGuarded(ctx, account)
+	}
 	return p.database.MarkReloginPromptSent(ctx, account.TelegramUserID, nil)
 }
 
@@ -166,6 +171,21 @@ func (p *GmailPoller) HandleInvalidGrant(ctx context.Context, account models.Goo
 }
 
 func (p *GmailPoller) handleInvalidGrant(ctx context.Context, account models.GoogleAccount, exc error) {
+	guardedDelete := false
+	if guarded, ok := p.database.(interface {
+		DeleteGoogleAccountGuarded(context.Context, models.GoogleAccount) (bool, error)
+	}); ok {
+		deleted, err := guarded.DeleteGoogleAccountGuarded(ctx, account)
+		if err != nil {
+			applog.Errorf("Failed to disconnect expired authorization: %v", err)
+			return
+		}
+		if !deleted {
+			return
+		}
+		guardedDelete = true
+	}
+
 	applog.Warningf(
 		"Google authorization expired or was revoked for Telegram user %d (%s): %v",
 		account.TelegramUserID,
@@ -179,9 +199,11 @@ func (p *GmailPoller) handleInvalidGrant(ctx context.Context, account models.Goo
 			applog.Errorf("Failed to notify Telegram user %d about expired Gmail authorization: %v", account.TelegramUserID, err)
 		}
 	}
-	if err := p.database.DeleteGoogleAccount(ctx, account.TelegramUserID); err != nil {
-		applog.Errorf("Failed to disconnect Gmail account for Telegram user %d: %v", account.TelegramUserID, err)
-		return
+	if !guardedDelete {
+		if err := p.database.DeleteGoogleAccount(ctx, account.TelegramUserID); err != nil {
+			applog.Errorf("Failed to disconnect Gmail account for Telegram user %d: %v", account.TelegramUserID, err)
+			return
+		}
 	}
 	applog.Infof("Disconnected Gmail account for Telegram user %d after invalid_grant.", account.TelegramUserID)
 }

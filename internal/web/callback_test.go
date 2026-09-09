@@ -127,7 +127,7 @@ func TestCallbackReusesExistingRefreshToken(t *testing.T) {
 	})
 	mux.HandleFunc("/gmail/v1/users/me/profile", func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"emailAddress": "new@example.com",
+			"emailAddress": "old@example.com",
 			"historyId":    "99",
 		})
 	})
@@ -148,7 +148,7 @@ func TestCallbackReusesExistingRefreshToken(t *testing.T) {
 	if account.RefreshToken != "existing-refresh" {
 		t.Fatalf("refresh token lost: %q", account.RefreshToken)
 	}
-	if account.AccessToken != "new-access" || account.GmailEmail != "new@example.com" {
+	if account.AccessToken != "new-access" || account.GmailEmail != "old@example.com" {
 		t.Fatalf("account not updated: %+v", account)
 	}
 }
