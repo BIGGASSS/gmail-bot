@@ -88,6 +88,13 @@ func (d *Database) Initialize(ctx context.Context) error {
 	schema := fmt.Sprintf(`
 CREATE TABLE IF NOT EXISTS auth_versions (telegram_user_id INTEGER PRIMARY KEY, generation INTEGER NOT NULL DEFAULT 0, attempt TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS oauth_attempts (state TEXT PRIMARY KEY REFERENCES oauth_states(state) ON DELETE CASCADE, generation INTEGER NOT NULL, relog INTEGER NOT NULL);
+-- Keep relog protection independent of single-use oauth_states, which callbacks consume.
+CREATE TABLE IF NOT EXISTS pending_relogs (
+    telegram_user_id INTEGER PRIMARY KEY REFERENCES auth_versions(telegram_user_id),
+    state TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    expires_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS oauth_states (
     state TEXT PRIMARY KEY,
     telegram_user_id INTEGER NOT NULL,
@@ -133,6 +140,18 @@ CREATE TABLE IF NOT EXISTS delivered_messages (
 
 	if _, err := d.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("create schema: %w", err)
+	}
+	// Migrate still-pending links from the original schema. Never overwrite durable
+	// records: their oauth_states row may already have been consumed by a callback.
+	if _, err := d.db.ExecContext(ctx, `
+INSERT INTO pending_relogs (telegram_user_id, state, generation, expires_at)
+SELECT s.telegram_user_id, s.state, a.generation, s.expires_at
+FROM oauth_states s JOIN oauth_attempts a ON a.state = s.state
+JOIN auth_versions v ON v.telegram_user_id = s.telegram_user_id
+    AND v.attempt = s.state AND v.generation = a.generation
+WHERE a.relog = 1
+ON CONFLICT(telegram_user_id) DO NOTHING`); err != nil {
+		return fmt.Errorf("backfill pending relogs: %w", err)
 	}
 	if err := d.ensureGoogleAccountReloginPromptColumns(ctx); err != nil {
 		return err

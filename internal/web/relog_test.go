@@ -18,6 +18,7 @@ func TestRelogCallback(t *testing.T) {
 		ok          bool
 	}{
 		{"success", "USER@example.com", "fresh-refresh", true},
+		{"expires during relog", "user@example.com", "fresh-refresh", true},
 		{"wrong account", "other@example.com", "fresh-refresh", false},
 		{"missing refresh", "user@example.com", nil, false},
 		{"empty refresh", "user@example.com", "", false},
@@ -47,6 +48,13 @@ func TestRelogCallback(t *testing.T) {
 					}
 					_ = json.NewEncoder(w).Encode(p)
 					return
+				}
+				if tc.name == "expires during relog" {
+					// State has already been consumed. Automatic invalid_grant
+					// cleanup must not destroy the in-flight relog's metadata.
+					if deleted, err := db.DeleteGoogleAccountGuarded(ctx, *before); err != nil || deleted {
+						t.Errorf("pending relog deleted: %v, %v", deleted, err)
+					}
 				}
 				// Simulate polling and a preference change while OAuth is in progress.
 				if err := db.UpdateLastHistoryID(ctx, 42, "20"); err != nil {

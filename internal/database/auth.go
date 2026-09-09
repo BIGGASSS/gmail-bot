@@ -46,6 +46,14 @@ func (d *Database) StoreOAuthAttempt(ctx context.Context, state string, user int
 	if _, err = tx.ExecContext(ctx, `INSERT INTO oauth_attempts VALUES (?, ?, ?)`, state, generation, relog); err != nil {
 		return err
 	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM pending_relogs WHERE telegram_user_id = ?`, user); err != nil {
+		return err
+	}
+	if relog {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO pending_relogs (telegram_user_id, state, generation, expires_at) VALUES (?, ?, ?, ?)`, user, state, generation, ToISO8601(expires)); err != nil {
+			return err
+		}
+	}
 	return tx.Commit()
 }
 
@@ -112,8 +120,21 @@ func (d *Database) UpdateTokensGuarded(ctx context.Context, a models.GoogleAccou
 	return nil
 }
 
+// DeleteGoogleAccountGuarded handles automatic invalid_grant cleanup, not logout.
+// An active relog owns the chance to replace expired credentials without losing
+// account metadata or cascading deletion of delivery records. Its protection is
+// durable across state consumption/restarts, but bounded by the link's expiry.
 func (d *Database) DeleteGoogleAccountGuarded(ctx context.Context, a models.GoogleAccount) (bool, error) {
-	result, err := d.db.ExecContext(ctx, `DELETE FROM google_accounts WHERE telegram_user_id = ? AND generation = ? AND refresh_token = ? AND access_token = ?`, a.TelegramUserID, a.Generation, a.RefreshToken, a.AccessToken)
+	result, err := d.db.ExecContext(ctx, `
+DELETE FROM google_accounts
+WHERE telegram_user_id = ? AND generation = ? AND refresh_token = ? AND access_token = ?
+AND NOT EXISTS (
+    SELECT 1 FROM pending_relogs r
+    JOIN auth_versions v ON v.telegram_user_id = r.telegram_user_id
+        AND v.attempt = r.state AND v.generation = r.generation
+    WHERE r.telegram_user_id = google_accounts.telegram_user_id
+        AND r.generation = google_accounts.generation AND r.expires_at > ?
+)`, a.TelegramUserID, a.Generation, a.RefreshToken, a.AccessToken, ToISO8601(UTCNow()))
 	if err != nil {
 		return false, err
 	}

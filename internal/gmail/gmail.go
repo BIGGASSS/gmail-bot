@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -381,8 +382,25 @@ func (s *Service) forceRefresh(ctx context.Context, account models.GoogleAccount
 	} else {
 		storeErr = s.database.UpdateTokens(ctx, account.TelegramUserID, tokens.AccessToken, tokens.ExpiresAt, &refreshToken)
 	}
-	if err := storeErr; err != nil {
-		return models.GoogleAccount{}, err
+	if errors.Is(storeErr, database.ErrStaleAuthorization) {
+		if store, ok := s.database.(interface {
+			GetGoogleAccount(context.Context, int64) (*models.GoogleAccount, error)
+		}); ok {
+			current, err := store.GetGoogleAccount(ctx, account.TelegramUserID)
+			if err != nil {
+				return models.GoogleAccount{}, err
+			}
+			// Another ordinary refresh may have won the token CAS. Reuse its
+			// credentials, but never cross a logout/reauthorization boundary
+			// or replace this operation's cursor and other snapshot metadata.
+			if current != nil && current.Generation == account.Generation && current.TokenExpiry.After(time.Now().UTC()) {
+				account.AccessToken, account.RefreshToken, account.TokenExpiry = current.AccessToken, current.RefreshToken, current.TokenExpiry
+				return account, nil
+			}
+		}
+	}
+	if storeErr != nil {
+		return models.GoogleAccount{}, storeErr
 	}
 	account.AccessToken = tokens.AccessToken
 	account.RefreshToken = refreshToken
