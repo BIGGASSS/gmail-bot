@@ -86,6 +86,15 @@ func (d *Database) Close() error {
 
 func (d *Database) Initialize(ctx context.Context) error {
 	schema := fmt.Sprintf(`
+CREATE TABLE IF NOT EXISTS auth_versions (telegram_user_id INTEGER PRIMARY KEY, generation INTEGER NOT NULL DEFAULT 0, attempt TEXT NOT NULL DEFAULT '');
+CREATE TABLE IF NOT EXISTS oauth_attempts (state TEXT PRIMARY KEY REFERENCES oauth_states(state) ON DELETE CASCADE, generation INTEGER NOT NULL, relog INTEGER NOT NULL);
+-- Keep relog protection independent of single-use oauth_states, which callbacks consume.
+CREATE TABLE IF NOT EXISTS pending_relogs (
+    telegram_user_id INTEGER PRIMARY KEY REFERENCES auth_versions(telegram_user_id),
+    state TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    expires_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS oauth_states (
     state TEXT PRIMARY KEY,
     telegram_user_id INTEGER NOT NULL,
@@ -132,6 +141,18 @@ CREATE TABLE IF NOT EXISTS delivered_messages (
 	if _, err := d.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("create schema: %w", err)
 	}
+	// Migrate still-pending links from the original schema. Never overwrite durable
+	// records: their oauth_states row may already have been consumed by a callback.
+	if _, err := d.db.ExecContext(ctx, `
+INSERT INTO pending_relogs (telegram_user_id, state, generation, expires_at)
+SELECT s.telegram_user_id, s.state, a.generation, s.expires_at
+FROM oauth_states s JOIN oauth_attempts a ON a.state = s.state
+JOIN auth_versions v ON v.telegram_user_id = s.telegram_user_id
+    AND v.attempt = s.state AND v.generation = a.generation
+WHERE a.relog = 1
+ON CONFLICT(telegram_user_id) DO NOTHING`); err != nil {
+		return fmt.Errorf("backfill pending relogs: %w", err)
+	}
 	if err := d.ensureGoogleAccountReloginPromptColumns(ctx); err != nil {
 		return err
 	}
@@ -170,6 +191,7 @@ func (d *Database) ensureGoogleAccountReloginPromptColumns(ctx context.Context) 
 		column string
 		sql    string
 	}{
+		{"generation", "ALTER TABLE google_accounts ADD COLUMN generation INTEGER NOT NULL DEFAULT 0"},
 		{"relogin_prompt_enabled", "ALTER TABLE google_accounts ADD COLUMN relogin_prompt_enabled INTEGER NOT NULL DEFAULT 1"},
 		{"relogin_prompt_delay_days", fmt.Sprintf("ALTER TABLE google_accounts ADD COLUMN relogin_prompt_delay_days INTEGER NOT NULL DEFAULT %d", models.DefaultReloginPromptDelayDays)},
 		{"relogin_prompt_base_at", "ALTER TABLE google_accounts ADD COLUMN relogin_prompt_base_at TEXT"},
@@ -322,16 +344,7 @@ ON CONFLICT(telegram_user_id) DO NOTHING
 }
 
 func (d *Database) StoreOAuthState(ctx context.Context, state string, telegramUserID int64, expiresAt time.Time) error {
-	now := ToISO8601(UTCNow())
-	_, err := d.db.ExecContext(ctx, `
-INSERT INTO oauth_states (state, telegram_user_id, created_at, expires_at)
-VALUES (?, ?, ?, ?)
-ON CONFLICT(state) DO UPDATE SET
-    telegram_user_id = excluded.telegram_user_id,
-    created_at = excluded.created_at,
-    expires_at = excluded.expires_at
-`, state, telegramUserID, now, ToISO8601(expiresAt))
-	return err
+	return d.StoreOAuthAttempt(ctx, state, telegramUserID, expiresAt, false)
 }
 
 func (d *Database) ConsumeOAuthState(ctx context.Context, state string) (*models.OAuthState, error) {
@@ -342,18 +355,21 @@ func (d *Database) ConsumeOAuthState(ctx context.Context, state string) (*models
 	defer func() { _ = tx.Rollback() }()
 
 	row := tx.QueryRowContext(ctx, `
-SELECT state, telegram_user_id, created_at, expires_at
-FROM oauth_states
-WHERE state = ?
+SELECT s.state, s.telegram_user_id, s.created_at, s.expires_at, a.generation, a.relog
+FROM oauth_states s JOIN oauth_attempts a ON a.state = s.state
+JOIN auth_versions v ON v.telegram_user_id = s.telegram_user_id AND v.attempt = s.state AND v.generation = a.generation
+WHERE s.state = ?
 `, state)
 
 	var (
+		generation     int64
+		relog          bool
 		rawState       string
 		telegramUserID int64
 		createdAtRaw   string
 		expiresAtRaw   string
 	)
-	if err := row.Scan(&rawState, &telegramUserID, &createdAtRaw, &expiresAtRaw); err != nil {
+	if err := row.Scan(&rawState, &telegramUserID, &createdAtRaw, &expiresAtRaw, &generation, &relog); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
 		}
@@ -377,6 +393,8 @@ WHERE state = ?
 	}
 	oauthState := &models.OAuthState{
 		State:          rawState,
+		Generation:     generation,
+		Relog:          relog,
 		TelegramUserID: telegramUserID,
 		CreatedAt:      createdAt,
 		ExpiresAt:      expiresAt,
@@ -388,8 +406,18 @@ WHERE state = ?
 }
 
 func (d *Database) DeleteOAuthStatesForUser(ctx context.Context, telegramUserID int64) error {
-	_, err := d.db.ExecContext(ctx, `DELETE FROM oauth_states WHERE telegram_user_id = ?`, telegramUserID)
-	return err
+	tx, err := d.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.ExecContext(ctx, `UPDATE auth_versions SET attempt = '' WHERE telegram_user_id = ?`, telegramUserID); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM oauth_states WHERE telegram_user_id = ?`, telegramUserID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (d *Database) CleanupExpiredOAuthStates(ctx context.Context) error {
@@ -414,6 +442,21 @@ type UpsertGoogleAccountParams struct {
 }
 
 func (d *Database) UpsertGoogleAccount(ctx context.Context, params UpsertGoogleAccountParams) error {
+	tx, err := d.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := upsertAccount(ctx, tx, params); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func upsertAccount(ctx context.Context, tx *sql.Tx, params UpsertGoogleAccountParams) error {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO auth_versions (telegram_user_id, generation) VALUES (?, 1) ON CONFLICT(telegram_user_id) DO UPDATE SET generation = generation + 1`, params.TelegramUserID); err != nil {
+		return err
+	}
 	if params.ReloginPromptDelayDays == 0 {
 		params.ReloginPromptDelayDays = models.DefaultReloginPromptDelayDays
 	}
@@ -427,7 +470,7 @@ func (d *Database) UpsertGoogleAccount(ctx context.Context, params UpsertGoogleA
 	}
 	now := ToISO8601(UTCNow())
 
-	_, err := d.db.ExecContext(ctx, `
+	_, err := tx.ExecContext(ctx, `
 INSERT INTO google_accounts (
     telegram_user_id,
     gmail_email,
@@ -442,10 +485,11 @@ INSERT INTO google_accounts (
     relogin_prompt_due_at,
     relogin_prompt_sent_at,
     created_at,
-    updated_at
+    updated_at, generation
 )
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (SELECT generation FROM auth_versions WHERE telegram_user_id = ?))
 ON CONFLICT(telegram_user_id) DO UPDATE SET
+    generation = excluded.generation,
     gmail_email = excluded.gmail_email,
     access_token = excluded.access_token,
     refresh_token = excluded.refresh_token,
@@ -473,6 +517,7 @@ ON CONFLICT(telegram_user_id) DO UPDATE SET
 		nil,
 		now,
 		now,
+		params.TelegramUserID,
 	)
 	return err
 }
@@ -491,7 +536,7 @@ SELECT
     relogin_prompt_delay_days,
     relogin_prompt_base_at,
     relogin_prompt_due_at,
-    relogin_prompt_sent_at
+    relogin_prompt_sent_at, generation
 FROM google_accounts
 WHERE telegram_user_id = ?
 `, telegramUserID)
@@ -516,7 +561,7 @@ SELECT
     relogin_prompt_delay_days,
     relogin_prompt_base_at,
     relogin_prompt_due_at,
-    relogin_prompt_sent_at
+    relogin_prompt_sent_at, generation
 FROM google_accounts
 ORDER BY telegram_user_id ASC
 `)
@@ -588,25 +633,6 @@ WHERE telegram_user_id = ?
 	}, nil
 }
 
-func (d *Database) upsertReloginPromptPreferences(ctx context.Context, preferences models.ReloginPromptPreferences, now time.Time) error {
-	nowRaw := ToISO8601(now)
-	_, err := d.db.ExecContext(ctx, `
-INSERT INTO relogin_prompt_preferences (
-    telegram_user_id,
-    relogin_prompt_enabled,
-    relogin_prompt_delay_days,
-    created_at,
-    updated_at
-)
-VALUES (?, ?, ?, ?, ?)
-ON CONFLICT(telegram_user_id) DO UPDATE SET
-    relogin_prompt_enabled = excluded.relogin_prompt_enabled,
-    relogin_prompt_delay_days = excluded.relogin_prompt_delay_days,
-    updated_at = excluded.updated_at
-`, preferences.TelegramUserID, boolToInt(preferences.ReloginPromptEnabled), preferences.ReloginPromptDelayDays, nowRaw, nowRaw)
-	return err
-}
-
 func (d *Database) MarkReloginPromptSent(ctx context.Context, telegramUserID int64, sentAt *time.Time) error {
 	value := UTCNow()
 	if sentAt != nil {
@@ -620,65 +646,50 @@ WHERE telegram_user_id = ?
 	return err
 }
 
-func (d *Database) SetReloginPromptEnabled(ctx context.Context, telegramUserID int64, enabled bool) error {
-	current, err := d.GetReloginPromptPreferences(ctx, telegramUserID)
+func (d *Database) SetReloginPromptEnabled(ctx context.Context, user int64, enabled bool) error {
+	tx, err := d.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	now := UTCNow()
-	if err := d.upsertReloginPromptPreferences(ctx, models.ReloginPromptPreferences{
-		TelegramUserID:         telegramUserID,
-		ReloginPromptEnabled:   enabled,
-		ReloginPromptDelayDays: current.ReloginPromptDelayDays,
-	}, now); err != nil {
+	defer tx.Rollback()
+	now := ToISO8601(UTCNow())
+	if _, err = tx.ExecContext(ctx, `INSERT INTO relogin_prompt_preferences (telegram_user_id, relogin_prompt_enabled, created_at, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(telegram_user_id) DO UPDATE SET relogin_prompt_enabled = excluded.relogin_prompt_enabled, updated_at = excluded.updated_at`, user, boolToInt(enabled), now, now); err != nil {
 		return err
 	}
-	_, err = d.db.ExecContext(ctx, `
-UPDATE google_accounts
-SET relogin_prompt_enabled = ?, updated_at = ?
-WHERE telegram_user_id = ?
-`, boolToInt(enabled), ToISO8601(now), telegramUserID)
-	return err
+	if _, err = tx.ExecContext(ctx, `UPDATE google_accounts SET relogin_prompt_enabled = ?, updated_at = ? WHERE telegram_user_id = ?`, boolToInt(enabled), now, user); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
-func (d *Database) SetReloginPromptDelayDays(ctx context.Context, telegramUserID int64, delayDays int) error {
-	current, err := d.GetReloginPromptPreferences(ctx, telegramUserID)
+func (d *Database) SetReloginPromptDelayDays(ctx context.Context, user int64, days int) error {
+	if days < 1 {
+		return fmt.Errorf("reminder delay must be positive")
+	}
+	tx, err := d.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	now := UTCNow()
-	if err := d.upsertReloginPromptPreferences(ctx, models.ReloginPromptPreferences{
-		TelegramUserID:         telegramUserID,
-		ReloginPromptEnabled:   current.ReloginPromptEnabled,
-		ReloginPromptDelayDays: delayDays,
-	}, now); err != nil {
+	defer tx.Rollback()
+	now := ToISO8601(UTCNow())
+	if _, err = tx.ExecContext(ctx, `INSERT INTO relogin_prompt_preferences (telegram_user_id, relogin_prompt_delay_days, created_at, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(telegram_user_id) DO UPDATE SET relogin_prompt_delay_days = excluded.relogin_prompt_delay_days, updated_at = excluded.updated_at`, user, days, now, now); err != nil {
 		return err
 	}
-
-	account, err := d.GetGoogleAccount(ctx, telegramUserID)
-	if err != nil {
+	var rawBase string
+	err = tx.QueryRowContext(ctx, `SELECT COALESCE(relogin_prompt_base_at, connected_at) FROM google_accounts WHERE telegram_user_id = ?`, user).Scan(&rawBase)
+	if err != nil && err != sql.ErrNoRows {
 		return err
 	}
-	if account != nil {
-		baseAt := account.ConnectedAt
-		if account.ReloginPromptBaseAt != nil {
-			baseAt = *account.ReloginPromptBaseAt
+	if err == nil {
+		base, err := FromISO8601(rawBase)
+		if err != nil {
+			return err
 		}
-		dueAt := baseAt.Add(time.Duration(delayDays) * 24 * time.Hour)
-		if _, err := d.db.ExecContext(ctx, `
-UPDATE google_accounts
-SET
-    relogin_prompt_delay_days = ?,
-    relogin_prompt_base_at = ?,
-    relogin_prompt_due_at = ?,
-    relogin_prompt_sent_at = NULL,
-    updated_at = ?
-WHERE telegram_user_id = ?
-`, delayDays, ToISO8601(baseAt), ToISO8601(dueAt), ToISO8601(now), telegramUserID); err != nil {
+		if _, err = tx.ExecContext(ctx, `UPDATE google_accounts SET relogin_prompt_delay_days = ?, relogin_prompt_base_at = ?, relogin_prompt_due_at = ?, relogin_prompt_sent_at = NULL, updated_at = ? WHERE telegram_user_id = ?`, days, rawBase, ToISO8601(base.Add(time.Duration(days)*24*time.Hour)), now, user); err != nil {
 			return err
 		}
 	}
-	return nil
+	return tx.Commit()
 }
 
 func (d *Database) DeleteGoogleAccount(ctx context.Context, telegramUserID int64) error {
@@ -734,6 +745,7 @@ func scanAccount(row scannable) (*models.GoogleAccount, error) {
 		reloginBaseAtRaw sql.NullString
 		reloginDueAtRaw  sql.NullString
 		reloginSentAtRaw sql.NullString
+		generation       int64
 	)
 	if err := row.Scan(
 		&userID,
@@ -748,6 +760,7 @@ func scanAccount(row scannable) (*models.GoogleAccount, error) {
 		&reloginBaseAtRaw,
 		&reloginDueAtRaw,
 		&reloginSentAtRaw,
+		&generation,
 	); err != nil {
 		return nil, err
 	}
@@ -764,6 +777,7 @@ func scanAccount(row scannable) (*models.GoogleAccount, error) {
 	account := &models.GoogleAccount{
 		TelegramUserID:         userID,
 		GmailEmail:             email,
+		Generation:             generation,
 		AccessToken:            accessToken,
 		RefreshToken:           refreshToken,
 		TokenExpiry:            tokenExpiry,

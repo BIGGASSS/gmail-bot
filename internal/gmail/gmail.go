@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -345,6 +346,19 @@ func (s *Service) doAuthorized(ctx context.Context, method, rawURL string, param
 }
 
 func (s *Service) ensureValidAccessToken(ctx context.Context, account models.GoogleAccount) (models.GoogleAccount, error) {
+	if store, ok := s.database.(interface {
+		GetGoogleAccount(context.Context, int64) (*models.GoogleAccount, error)
+	}); ok {
+		current, err := store.GetGoogleAccount(ctx, account.TelegramUserID)
+		if err != nil {
+			return models.GoogleAccount{}, err
+		}
+		if current == nil || current.Generation != account.Generation {
+			return models.GoogleAccount{}, database.ErrStaleAuthorization
+		}
+		account.AccessToken, account.RefreshToken, account.TokenExpiry = current.AccessToken, current.RefreshToken, current.TokenExpiry
+	}
+
 	if account.TokenExpiry.After(time.Now().UTC()) {
 		return account, nil
 	}
@@ -360,8 +374,33 @@ func (s *Service) forceRefresh(ctx context.Context, account models.GoogleAccount
 	if tokens.RefreshToken != nil && *tokens.RefreshToken != "" {
 		refreshToken = *tokens.RefreshToken
 	}
-	if err := s.database.UpdateTokens(ctx, account.TelegramUserID, tokens.AccessToken, tokens.ExpiresAt, &refreshToken); err != nil {
-		return models.GoogleAccount{}, err
+	var storeErr error
+	if guarded, ok := s.database.(interface {
+		UpdateTokensGuarded(context.Context, models.GoogleAccount, string, time.Time, *string) error
+	}); ok {
+		storeErr = guarded.UpdateTokensGuarded(ctx, account, tokens.AccessToken, tokens.ExpiresAt, &refreshToken)
+	} else {
+		storeErr = s.database.UpdateTokens(ctx, account.TelegramUserID, tokens.AccessToken, tokens.ExpiresAt, &refreshToken)
+	}
+	if errors.Is(storeErr, database.ErrStaleAuthorization) {
+		if store, ok := s.database.(interface {
+			GetGoogleAccount(context.Context, int64) (*models.GoogleAccount, error)
+		}); ok {
+			current, err := store.GetGoogleAccount(ctx, account.TelegramUserID)
+			if err != nil {
+				return models.GoogleAccount{}, err
+			}
+			// Another ordinary refresh may have won the token CAS. Reuse its
+			// credentials, but never cross a logout/reauthorization boundary
+			// or replace this operation's cursor and other snapshot metadata.
+			if current != nil && current.Generation == account.Generation && current.TokenExpiry.After(time.Now().UTC()) {
+				account.AccessToken, account.RefreshToken, account.TokenExpiry = current.AccessToken, current.RefreshToken, current.TokenExpiry
+				return account, nil
+			}
+		}
+	}
+	if storeErr != nil {
+		return models.GoogleAccount{}, storeErr
 	}
 	account.AccessToken = tokens.AccessToken
 	account.RefreshToken = refreshToken

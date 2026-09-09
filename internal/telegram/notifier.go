@@ -49,7 +49,7 @@ func (n *Notifier) SendLoginSuccess(ctx context.Context, chatID int64, gmailEmai
 
 func (n *Notifier) SendManualReloginPrompt(ctx context.Context, chatID int64, gmailEmail string, delayDays int) error {
 	return n.SendText(ctx, chatID, fmt.Sprintf(
-		"It has been %s since you connected Gmail: %s\nGoogle may revoke this connection after a week without warning.\nPlease refresh the connection now by sending /logout, then /login.",
+		"It has been %s since you last authorized Gmail: %s\nGoogle may revoke this connection after a week without warning.\nPlease refresh the connection now by sending /relog. Forwarding stays active while you authorize the same Gmail account.",
 		FormatDayCount(delayDays),
 		gmailEmail,
 	))
