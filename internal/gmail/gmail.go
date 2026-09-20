@@ -273,7 +273,10 @@ func (s *Service) GetExpandedMessage(ctx context.Context, account models.GoogleA
 	}
 	headers := extractHeaders(payload)
 	payloadPart, _ := payload["payload"].(map[string]any)
-	bodyText, attachments := ExtractBodyAndAttachments(payloadPart)
+	bodyText, attachments, err := ExtractBodyAndAttachments(payloadPart)
+	if err != nil {
+		return models.ExpandedMail{}, fmt.Errorf("extract message body: %w", err)
+	}
 	if bodyText == "" {
 		bodyText = "(no body text available)"
 	}

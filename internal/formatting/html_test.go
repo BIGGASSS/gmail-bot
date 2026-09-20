@@ -8,6 +8,15 @@ import (
 	"testing"
 )
 
+func mustHTMLText(t *testing.T, input string) string {
+	t.Helper()
+	text, err := HTMLToTelegramText(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return text
+}
+
 func TestHTMLAccountNoticeFixture(t *testing.T) {
 	input, err := os.ReadFile("testdata/account-notice.html")
 	if err != nil {
@@ -17,7 +26,7 @@ func TestHTMLAccountNoticeFixture(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := RenderTelegramHTML(HTMLToTelegramText(string(input)))
+	got := RenderTelegramHTML(mustHTMLText(t, string(input)))
 	if got != strings.TrimSuffix(string(want), "\n") {
 		t.Fatalf("account notice differs:\ngot:\n%s\nwant:\n%s", got, want)
 	}
@@ -49,7 +58,7 @@ func TestHTMLStructuralWhitespace(t *testing.T) {
 		{"emoji joiners retained", "<p>Person: 👩\u200d💻; word: a\u200cb</p>", "Person: 👩\u200d💻; word: a\u200cb"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := HTMLToTelegramText(tt.input); got != tt.want {
+			if got := mustHTMLText(t, tt.input); got != tt.want {
 				t.Fatalf("got %q, want %q", got, tt.want)
 			}
 		})
@@ -78,7 +87,7 @@ func TestHTMLHiddenSubtrees(t *testing.T) {
 			if strings.HasPrefix(hidden, "<tr") {
 				input = `<table>` + hidden + `</table><p>Visible</p>`
 			}
-			if got := HTMLToTelegramText(input); got != "Visible" {
+			if got := mustHTMLText(t, input); got != "Visible" {
 				t.Fatalf("got %q", got)
 			}
 		})
@@ -90,7 +99,7 @@ func TestHTMLHiddenSubtrees(t *testing.T) {
 		`<div aria-hidden="true">Visible</div>`,
 		`<div style="mso-hide:all">Visible</div>`,
 	} {
-		if got := HTMLToTelegramText(input); got != "Visible" {
+		if got := mustHTMLText(t, input); got != "Visible" {
 			t.Fatalf("visible element %q became %q", input, got)
 		}
 	}
@@ -110,7 +119,7 @@ func TestHTMLVisibilityOverrides(t *testing.T) {
 		{"table fragments", `<table style="visibility:collapse"><tr><td>Secret</td><td style="visibility:visible">Visible</td><td>Secret</td></tr><tr><td>Secret</td></tr></table>`, " | Visible | "},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := HTMLToTelegramText(tt.input); got != tt.want {
+			if got := mustHTMLText(t, tt.input); got != tt.want {
 				t.Fatalf("got %q, want %q", got, tt.want)
 			}
 		})
@@ -118,7 +127,8 @@ func TestHTMLVisibilityOverrides(t *testing.T) {
 }
 
 func TestHTMLDeepNesting(t *testing.T) {
-	const depth = 1000
+	// Remain within the pre-parse budget while exercising every render limit.
+	const depth = 500
 	for _, tt := range []struct{ name, open, close string }{
 		{"lists", "<ul><li>x", "</li></ul>"},
 		{"wrappers", "<div>x", "</div>"},
@@ -135,7 +145,7 @@ func TestHTMLDeepNesting(t *testing.T) {
 			runtime.GC()
 			var before, after runtime.MemStats
 			runtime.ReadMemStats(&before)
-			got := HTMLToTelegramText(input)
+			got := mustHTMLText(t, input)
 			runtime.ReadMemStats(&after)
 			if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 16<<20 {
 				t.Fatalf("deep HTML allocated %d bytes (limit 16 MiB)", allocated)
@@ -181,7 +191,7 @@ func TestHTMLConditionalBranches(t *testing.T) {
 		{"comment mentions if", `<!-- [if mso]>This is just an explanatory comment. --><p>Body</p><!--<![endif]-->`, "Body"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := HTMLToTelegramText(tt.input); got != tt.want {
+			if got := mustHTMLText(t, tt.input); got != tt.want {
 				t.Fatalf("got %q, want %q", got, tt.want)
 			}
 		})
@@ -202,7 +212,7 @@ func TestHTMLMalformedMarkup(t *testing.T) {
 		{`<svg><a href="https://one.example">One<a href="https://two.example">Two</a></a></svg>`, EncodeLinkToken("OneTwo", "https://one.example")},
 	} {
 		t.Run(tt.input, func(t *testing.T) {
-			if got := HTMLToTelegramText(tt.input); got != tt.want {
+			if got := mustHTMLText(t, tt.input); got != tt.want {
 				t.Fatalf("got %q, want %q", got, tt.want)
 			}
 		})
@@ -230,7 +240,7 @@ func TestHTMLAnchorBoundariesAndSchemes(t *testing.T) {
 		{`<a href="https://example.com/%zz">label</a>`, "label"},
 	} {
 		t.Run(tt.input, func(t *testing.T) {
-			if got := HTMLToTelegramText(tt.input); got != tt.want {
+			if got := mustHTMLText(t, tt.input); got != tt.want {
 				t.Fatalf("got %q, want %q", got, tt.want)
 			}
 		})
@@ -246,7 +256,7 @@ func TestHTMLCannotForgeLinkTokens(t *testing.T) {
 			`<a href="https://safe.example">` + value + `</a>`,
 			`<a href="https://safe.example/` + value + `">Label</a>`,
 		} {
-			converted := HTMLToTelegramText(input)
+			converted := mustHTMLText(t, input)
 			for _, rendered := range append(RenderAndChunk(converted, SafeByteLimit), RenderTelegramHTML(converted)) {
 				if strings.Contains(rendered, `href="https://evil.example"`) || strings.ContainsAny(rendered, linkTokenStart+linkTokenSeparator+linkTokenEnd) {
 					t.Fatalf("forged token survived HTML conversion: %q", rendered)
@@ -259,7 +269,7 @@ func TestHTMLCannotForgeLinkTokens(t *testing.T) {
 func TestHTMLLongLinkChunkRegression(t *testing.T) {
 	label := strings.Repeat("世界 & < 🚀 ", 1500)
 	input := `<p>Before</p><p><a href="https://example.com/?a=1&amp;b=2">` + html.EscapeString(label) + `</a></p><p>After</p>`
-	converted := HTMLToTelegramText(input)
+	converted := mustHTMLText(t, input)
 	if got, want := converted, "Before\n\n"+EncodeLinkToken(strings.TrimSpace(label), "https://example.com/?a=1&b=2")+"\n\nAfter"; got != want {
 		t.Fatal("HTML conversion corrupted a long label or its boundaries")
 	}

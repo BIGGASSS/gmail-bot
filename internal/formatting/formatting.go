@@ -2,8 +2,10 @@ package formatting
 
 import (
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"html"
+	"io"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -145,25 +147,52 @@ func RenderTelegramHTML(value string) string {
 	return b.String()
 }
 
-func StripHTML(value string) string {
-	return NormalizeWhitespace(extractHTMLText(value, false))
+// ErrHTMLResourceLimit identifies email HTML that exceeds the parsing budget.
+var ErrHTMLResourceLimit = errors.New("email HTML exceeds parsing resource limit")
+
+const (
+	maxHTMLBytes  = 2 << 20
+	maxHTMLMarkup = 4096
+)
+
+func StripHTML(value string) (string, error) {
+	text, err := extractHTMLText(value, false)
+	if err != nil {
+		return "", err
+	}
+	return NormalizeWhitespace(text), nil
 }
 
-func HTMLToTelegramText(value string) string {
+// HTMLToTelegramText converts email HTML to text with safe link tokens.
+// Sources over 2 MiB or 4096 '<' delimiters return ErrHTMLResourceLimit;
+// parsing failures return an error, never a partial or fallback body.
+func HTMLToTelegramText(value string) (string, error) {
 	return extractHTMLText(value, true)
 }
 
-func extractHTMLText(value string, preserveAnchorTextLinks bool) string {
+func extractHTMLText(value string, preserveAnchorTextLinks bool) (string, error) {
+	// Bound work BEFORE tokenization or DOM construction. The DOM parser can
+	// do quadratic work on nested/malformed markup. Counting every '<' also
+	// bounds nesting, including unclosed tags and foreign-content/raw-text
+	// ambiguities that a separate tag-balancing scanner could misinterpret.
+	// This deliberately counts delimiters in comments, attributes and text too.
+	if len(value) > maxHTMLBytes || strings.Count(value, "<") > maxHTMLMarkup {
+		return "", ErrHTMLResourceLimit
+	}
 	// Filter paired, downlevel-revealed Outlook branches before parsing: HTML
 	// error recovery can move their comment markers outside tables or the body.
 	// Raw bytes are retained, so the DOM parser alone decodes entities, once.
-	doc, err := nethtml.ParseWithOptions(strings.NewReader(filterHTMLConditionals(value)), nethtml.ParseOptionEnableScripting(false))
+	filtered, err := filterHTMLConditionals(value)
 	if err != nil {
-		return ""
+		return "", fmt.Errorf("filter email HTML conditionals: %w", err)
+	}
+	doc, err := nethtml.ParseWithOptions(strings.NewReader(filtered), nethtml.ParseOptionEnableScripting(false))
+	if err != nil {
+		return "", fmt.Errorf("parse email HTML: %w", err)
 	}
 	w := htmlTextWriter{links: preserveAnchorTextLinks}
 	w.walk(doc, false)
-	return w.out.String()
+	return w.out.String(), nil
 }
 
 // Bound fragment copying and indentation on pathological mail. Beyond these
@@ -212,7 +241,10 @@ func (w *htmlTextWriter) append(value string) {
 	} else if w.breaks > 0 {
 		// A preformatted fragment may already end in a newline.
 		s := w.out.String()
-		existing := len(s) - len(strings.TrimRight(s, "\n"))
+		existing := 0
+		for existing < w.breaks && existing < len(s) && s[len(s)-1-existing] == '\n' {
+			existing++
+		}
 		if w.breaks > existing {
 			w.out.WriteString(strings.Repeat("\n", w.breaks-existing))
 		}
@@ -329,31 +361,7 @@ func (w *htmlTextWriter) walk(n *nethtml.Node, pre bool) {
 			w.children(n, pre)
 			return
 		}
-		label := w.newFragment()
-		label.inAnchor = true
-		label.children(n, pre)
-		text := label.out.String()
-		href, _ := htmlAttribute(n, "href")
-		href = safeHTMLLink(href)
-		if href != "" && (text != "" || !w.invisible) {
-			if text == "" {
-				text = href
-			}
-			if w.links {
-				text = EncodeLinkToken(text, href)
-			} else if text != href {
-				text += " <" + href + ">"
-			}
-		}
-		if label.leadingBreak > 0 {
-			w.boundary(label.leadingBreak)
-		}
-		w.space = w.space || label.leadingSpace
-		w.append(text)
-		if label.breaks > 0 {
-			w.boundary(label.breaks)
-		}
-		w.space = w.space || label.space
+		w.anchor(n, pre, false)
 	case "ul", "ol":
 		if len(w.lists) >= maxHTMLListDepth {
 			w.flatten(n, pre)
@@ -434,8 +442,42 @@ func (w *htmlTextWriter) walk(n *nethtml.Node, pre bool) {
 	}
 }
 
-// flatten visits each remaining node once, without recursive fragments or
-// indentation. Visibility still inherits and can be overridden by descendants.
+func (w *htmlTextWriter) anchor(n *nethtml.Node, pre, flat bool) {
+	label := w.newFragment()
+	label.inAnchor = true
+	if flat {
+		// inAnchor prevents nested anchors from creating more fragments.
+		label.flatten(n, pre)
+	} else {
+		label.children(n, pre)
+	}
+	text := label.out.String()
+	href, _ := htmlAttribute(n, "href")
+	href = safeHTMLLink(href)
+	if href != "" && (text != "" || !w.invisible) {
+		if text == "" {
+			text = href
+		}
+		if w.links {
+			text = EncodeLinkToken(text, href)
+		} else if text != href {
+			text += " <" + href + ">"
+		}
+	}
+	if label.leadingBreak > 0 {
+		w.boundary(label.leadingBreak)
+	}
+	w.space = w.space || label.leadingSpace
+	w.append(text)
+	if label.breaks > 0 {
+		w.boundary(label.breaks)
+	}
+	w.space = w.space || label.space
+}
+
+// flatten visits each remaining node once, without recursive layout fragments
+// or indentation. Anchors use one non-nesting label fragment. Visibility still
+// inherits and can be overridden by descendants.
 func (w *htmlTextWriter) flatten(n *nethtml.Node, pre bool) {
 	type visit struct {
 		node      *nethtml.Node
@@ -466,6 +508,14 @@ func (w *htmlTextWriter) flatten(n *nethtml.Node, pre bool) {
 			}
 			v.invisible = invisible
 			switch n.Data {
+			case "a":
+				if !w.inAnchor {
+					inherited := w.invisible
+					w.invisible = v.invisible
+					w.anchor(n, v.pre, true)
+					w.invisible = inherited
+					continue
+				}
 			case "br":
 				if !v.invisible {
 					if v.pre {
@@ -596,7 +646,7 @@ func safeHTMLLink(value string) string {
 // Only paired markers can suppress content. An unmatched/malformed revealed
 // opener must not swallow the rest of a real message. Hidden conditional
 // comments remain comments, while !mso and unknown conditions fail open.
-func filterHTMLConditionals(value string) string {
+func filterHTMLConditionals(value string) (string, error) {
 	type frame struct {
 		start int
 		skip  bool
@@ -609,7 +659,10 @@ func filterHTMLConditionals(value string) string {
 		start := len(out)
 		out = append(out, tokenizer.Raw()...)
 		if kind == nethtml.ErrorToken {
-			return string(out)
+			if err := tokenizer.Err(); err != io.EOF {
+				return "", err
+			}
+			return string(out), nil
 		}
 		if kind == nethtml.StartTagToken {
 			name, _ := tokenizer.TagName()
