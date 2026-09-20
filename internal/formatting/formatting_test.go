@@ -9,13 +9,16 @@ import (
 )
 
 func TestStripHTMLCollapsesMarkup(t *testing.T) {
-	if got := StripHTML("<p>Hello <strong>world</strong></p>"); got != "Hello world" {
-		t.Fatalf("got %q", got)
+	if got, err := StripHTML("<p>Hello <strong>world</strong></p>"); err != nil || got != "Hello world" {
+		t.Fatalf("got %q, error %v", got, err)
 	}
 }
 
 func TestStripHTMLPreservesLinkTargets(t *testing.T) {
-	got := StripHTML(`<p><a href="https://example.com/deal">Join Pro now</a></p>`)
+	got, err := StripHTML(`<p><a href="https://example.com/deal">Join Pro now</a></p>`)
+	if err != nil {
+		t.Fatal(err)
+	}
 	want := "Join Pro now <https://example.com/deal>"
 	if got != want {
 		t.Fatalf("got %q want %q", got, want)
@@ -40,7 +43,7 @@ func TestRenderTelegramHTMLLinkifiesURLs(t *testing.T) {
 
 func TestRenderTelegramHTMLPreservesAnchorText(t *testing.T) {
 	rendered := RenderTelegramHTML(
-		HTMLToTelegramText(`<p><a href="https://example.com/deal?plan=pro&discount=50">Join Pro now</a></p>`),
+		mustHTMLText(t, `<p><a href="https://example.com/deal?plan=pro&discount=50">Join Pro now</a></p>`),
 	)
 	if !strings.Contains(rendered, `href="https://example.com/deal?plan=pro&amp;discount=50"`) {
 		t.Fatalf("missing href: %s", rendered)

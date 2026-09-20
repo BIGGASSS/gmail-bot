@@ -1,0 +1,49 @@
+<!doctype html>
+<html>
+<head>
+  <title>Account notice — not body text</title>
+  <style>.layout { width: 100%; } /* CSS must not appear */</style>
+  <!-- A sanitized, synthetic account email; no external assets are needed. -->
+</head>
+<body>
+  <div hidden>Your Google Account is ready. Hidden preview copy.</div>
+  <div style="display: none !important">Your Google Account is ready. Hidden mobile layout.</div>
+  <div style="VISIBILITY: hidden">Your Google Account is ready. Hidden desktop layout.</div>
+  <template><p>Template copy of the notice.</p></template>
+  <script>throw new Error('Not message text');</script>
+  <!--[if mso]><table><tr><td>Outlook-only account notice.</td></tr></table><![endif]-->
+  <!--[if (gte mso 9)|(IE)]><!-->
+  <table><tr><td>Revealed Outlook fallback copy.</td></tr></table>
+  <!--<![endif]-->
+  <v:roundrect href="https://example.invalid/outlook"><v:textbox>VML button copy.</v:textbox></v:roundrect>
+  <!--[if !mso]><!-->
+  <table role="presentation" class="layout">
+    <tr><td>
+      <div>&nbsp;&nbsp;&#8204;&#8203;&nbsp;</div>
+      <h1>Your Google Account is ready</h1>
+      <p>Hello <strong>Alex</strong>,</p>
+      <p>You can now use your account to sign in.<br>Keep your account details safe.</p>
+      <div>&nbsp;</div><div><br><br><br></div>
+      <p><a href="https://accounts.example.invalid/review?source=mail&amp;action=review">Review your account</a></p>
+      <p>This reminder is intentionally repeated.</p>
+      <p>This reminder is intentionally repeated.</p>
+      <ul>
+        <li>Choose a strong password.</li>
+        <li>Keep your recovery details current.</li>
+      </ul>
+      <p>Account summary:</p>
+      <table>
+        <tr><th>Account</th><th>Status</th></tr>
+        <tr><td>alex@example.invalid</td><td>Ready</td></tr>
+        <tr><td>&nbsp;</td><td>&nbsp;</td></tr>
+      </table>
+      <p>Thanks,<br>The account team</p>
+    </td></tr>
+  </table>
+  <!--<![endif]-->
+  <![if false]><p>Never-visible test branch.</p><![endif]>
+  <div style="visibility: collapse"><p>Collapsed duplicate footer.</p></div>
+  <!-- Footer tracking and layout comments are not text. -->
+  <img src="https://example.invalid/tracker" width="1" height="1" alt="">
+</body>
+</html>

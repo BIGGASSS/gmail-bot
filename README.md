@@ -81,6 +81,8 @@ Login links are sent only in private chat. Start a private chat with the bot bef
 
 Large mail backlogs are processed across polls without advancing past unfinished history. Expanded message bodies are capped at 50,000 internal-text runes, with a truncation notice; link tokens are never cut in half. Oversized links may be shown as plain text.
 
+Expanded messages prefer clean plain text within each MIME alternative group. If the plain alternative contains leaked Outlook/HTML markup, the bot uses the HTML alternative instead, excluding comments, scripts, styles, clearly hidden content, and Outlook-only fallbacks. Paragraphs, lists, links, and preformatted indentation are preserved; empty padding and excessive blank lines are removed. Independent message sections and intentional repeated text are retained. This is a text conversion, not a browser: external stylesheets and media queries are not evaluated. If no readable HTML alternative exists, the plain text is retained rather than losing the message. HTML exceeding source-size or conservative parser-work budgets is rejected with an expansion error rather than partially rendered; unusually complex formatting can trigger these limits even in small messages.
+
 SQLite database files and existing WAL/shared-memory sidecars must allow owner-only permissions (`0600`); startup fails if these permissions cannot be enforced. Newly created database directories use `0700`. No new environment variables are required.
 
 ### Refresh authorization without disconnecting

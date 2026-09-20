@@ -1,0 +1,23 @@
+Your Google Account is ready
+
+Hello Alex,
+
+You can now use your account to sign in.
+Keep your account details safe.
+
+<a href="https://accounts.example.invalid/review?source=mail&amp;action=review">Review your account</a>
+
+This reminder is intentionally repeated.
+
+This reminder is intentionally repeated.
+
+- Choose a strong password.
+- Keep your recovery details current.
+
+Account summary:
+
+Account | Status
+alex@example.invalid | Ready
+
+Thanks,
+The account team

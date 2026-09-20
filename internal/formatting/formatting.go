@@ -2,9 +2,13 @@ package formatting
 
 import (
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"html"
+	"io"
+	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -30,12 +34,13 @@ var (
 	linkTokenPattern = regexp.MustCompile(
 		linkTokenStart + `(?P<label>[A-Za-z0-9_-]+)` + linkTokenSeparator + `(?P<url>[A-Za-z0-9_-]+)` + linkTokenEnd,
 	)
-	blockTags = map[string]struct{}{
-		"address": {}, "article": {}, "aside": {}, "blockquote": {}, "br": {},
-		"div": {}, "dd": {}, "dl": {}, "dt": {}, "figcaption": {}, "figure": {},
-		"footer": {}, "h1": {}, "h2": {}, "h3": {}, "h4": {}, "h5": {}, "h6": {},
-		"header": {}, "hr": {}, "li": {}, "main": {}, "ol": {}, "p": {}, "pre": {},
-		"section": {}, "table": {}, "td": {}, "th": {}, "tr": {}, "ul": {},
+	// Structural boundaries, in newlines. Layout containers only need a line;
+	// paragraphs and headings deserve a blank line. Cells are handled per row.
+	blockTags = map[string]int{
+		"address": 1, "article": 2, "aside": 2, "blockquote": 2,
+		"div": 1, "dd": 1, "dl": 1, "dt": 1, "figcaption": 1, "figure": 2,
+		"footer": 2, "h1": 2, "h2": 2, "h3": 2, "h4": 2, "h5": 2, "h6": 2,
+		"header": 2, "main": 2, "p": 2, "section": 2, "table": 1,
 	}
 )
 
@@ -142,103 +147,611 @@ func RenderTelegramHTML(value string) string {
 	return b.String()
 }
 
-func StripHTML(value string) string {
-	return NormalizeWhitespace(extractHTMLText(value, false))
-}
+// ErrHTMLResourceLimit identifies email HTML that exceeds the parsing budget.
+var ErrHTMLResourceLimit = errors.New("email HTML exceeds parsing resource limit")
 
-func HTMLToTelegramText(value string) string {
-	return NormalizeWhitespace(extractHTMLText(value, true))
-}
+const (
+	maxHTMLBytes  = 2 << 20
+	maxHTMLMarkup = 4096
+)
 
-func extractHTMLText(value string, preserveAnchorTextLinks bool) string {
-	tokenizer := nethtml.NewTokenizer(strings.NewReader(value))
-	parts := make([]string, 0, 32)
-	type anchorFrame struct {
-		href       string
-		startIndex int
+func StripHTML(value string) (string, error) {
+	text, err := extractHTMLText(value, false)
+	if err != nil {
+		return "", err
 	}
-	var anchors []anchorFrame
+	return NormalizeWhitespace(text), nil
+}
 
-	handleStart := func(tag string, attrs []nethtml.Attribute) {
-		if _, ok := blockTags[tag]; ok {
-			parts = append(parts, "\n")
+// HTMLToTelegramText converts email HTML to text with safe link tokens.
+// Sources over 2 MiB, 4096 '<' delimiters, or the conservative formatting-clone
+// budget return ErrHTMLResourceLimit. Formatting-tag preflight also caps each
+// candidate at 8 KiB and cumulative scanning at 128 KiB, including overlaps.
+// Parsing failures return an error, never a partial or fallback body.
+func HTMLToTelegramText(value string) (string, error) {
+	return extractHTMLText(value, true)
+}
+
+func extractHTMLText(value string, preserveAnchorTextLinks bool) (string, error) {
+	// Bound source processing before tokenization. Count delimiters in comments,
+	// attributes and text too. These limits alone do not bound DOM allocation:
+	// HTML5 formatting reconstruction needs a separate amplification budget.
+	if len(value) > maxHTMLBytes || strings.Count(value, "<") > maxHTMLMarkup {
+		return "", ErrHTMLResourceLimit
+	}
+	// Filter paired, downlevel-revealed Outlook branches before parsing: HTML
+	// error recovery can move their comment markers outside tables or the body.
+	// Raw bytes are retained, so the DOM parser alone decodes entities, once.
+	filtered, err := filterHTMLConditionals(value)
+	if err != nil {
+		return "", fmt.Errorf("filter email HTML conditionals: %w", err)
+	}
+	if err := checkHTMLCloneBudget(filtered); err != nil {
+		return "", err
+	}
+	doc, err := nethtml.ParseWithOptions(strings.NewReader(filtered), nethtml.ParseOptionEnableScripting(false))
+	if err != nil {
+		return "", fmt.Errorf("parse email HTML: %w", err)
+	}
+	w := htmlTextWriter{links: preserveAnchorTextLinks}
+	w.walk(doc, false)
+	return w.out.String(), nil
+}
+
+// Bound fragment copying and indentation on pathological mail. Beyond these
+// limits, an iterative traversal retains text without complex layout formatting.
+const (
+	maxHTMLListDepth   = 8
+	maxHTMLRenderDepth = 64
+)
+
+// htmlTextWriter defers whitespace until visible content arrives. This ignores
+// source indentation and empty layout/spacer elements without deduplicating text.
+// Preformatted text bypasses whitespace folding (including its blank lines).
+// leading* also preserve the boundaries of fragments used as anchor labels.
+type htmlTextWriter struct {
+	out          strings.Builder
+	links        bool
+	inAnchor     bool
+	space        bool
+	breaks       int
+	leadingSpace bool
+	leadingBreak int
+	lists        []htmlList
+	depth        int
+	invisible    bool
+}
+
+type htmlList struct {
+	ordered bool
+	next    int
+	step    int
+}
+
+func (w *htmlTextWriter) boundary(lines int) {
+	if lines > w.breaks {
+		w.breaks = lines
+	}
+	w.space = false
+}
+
+func (w *htmlTextWriter) append(value string) {
+	if value == "" {
+		return
+	}
+	if w.out.Len() == 0 {
+		w.leadingSpace, w.leadingBreak = w.space, w.breaks
+	} else if w.breaks > 0 {
+		// A preformatted fragment may already end in a newline.
+		s := w.out.String()
+		existing := 0
+		for existing < w.breaks && existing < len(s) && s[len(s)-1-existing] == '\n' {
+			existing++
 		}
-		if tag == "a" {
-			href := ""
-			for _, attr := range attrs {
-				if attr.Key == "href" {
-					href = strings.TrimSpace(attr.Val)
-					break
+		if w.breaks > existing {
+			w.out.WriteString(strings.Repeat("\n", w.breaks-existing))
+		}
+	} else if w.space && !strings.HasSuffix(w.out.String(), "\n") {
+		w.out.WriteByte(' ')
+	}
+	w.space, w.breaks = false, 0
+	w.out.WriteString(value)
+}
+
+func (w *htmlTextWriter) text(value string, pre bool) {
+	value = SanitizeLinkTokenDelimiters(value)
+	if value == "" {
+		return
+	}
+	if pre {
+		w.append(value)
+		return
+	}
+	// Email spacers sometimes contain only invisible padding, not just NBSP.
+	// Keep these characters inside real words/emoji; only discard filler nodes.
+	if strings.TrimFunc(value, func(r rune) bool {
+		return unicode.IsSpace(r) || strings.ContainsRune("\u200b\u200c\u200d\ufeff\u00ad", r)
+	}) == "" {
+		w.space = true
+		return
+	}
+	start := 0
+	for i, r := range value {
+		if !unicode.IsSpace(r) {
+			continue
+		}
+		w.append(value[start:i])
+		w.space = true
+		start = i + len(string(r))
+	}
+	w.append(value[start:])
+}
+
+func (w *htmlTextWriter) children(n *nethtml.Node, pre bool) {
+	for c := n.FirstChild; c != nil; c = c.NextSibling {
+		w.walk(c, pre)
+	}
+}
+
+func (w *htmlTextWriter) fragment(n *nethtml.Node, pre bool, childrenOnly bool) *htmlTextWriter {
+	fragment := w.newFragment()
+	if childrenOnly {
+		fragment.children(n, pre)
+	} else {
+		fragment.walk(n, pre)
+	}
+	return fragment
+}
+
+func (w *htmlTextWriter) newFragment() *htmlTextWriter {
+	return &htmlTextWriter{
+		links: w.links, inAnchor: w.inAnchor, depth: w.depth, invisible: w.invisible,
+		// The list stack never exceeds maxHTMLListDepth.
+		lists: append([]htmlList(nil), w.lists...),
+	}
+}
+
+func (w *htmlTextWriter) walk(n *nethtml.Node, pre bool) {
+	if w.depth >= maxHTMLRenderDepth {
+		w.flatten(n, pre)
+		return
+	}
+	w.depth++
+	defer func() { w.depth-- }()
+	switch n.Type {
+	case nethtml.TextNode:
+		if !w.invisible {
+			w.text(n.Data, pre)
+		}
+		return
+	case nethtml.DocumentNode:
+		w.children(n, pre)
+		return
+	case nethtml.ElementNode:
+		prune, invisible := htmlElementVisibility(n, w.invisible)
+		if prune {
+			return
+		}
+		inherited := w.invisible
+		w.invisible = invisible
+		defer func() { w.invisible = inherited }()
+	default: // Comments and doctypes never contribute visible text.
+		return
+	}
+
+	switch n.Data {
+	case "br":
+		if w.invisible {
+			return
+		}
+		if pre {
+			w.append("\n")
+		} else if w.breaks < 2 {
+			w.boundary(w.breaks + 1)
+		}
+	case "hr":
+		if !w.invisible {
+			w.boundary(2)
+		}
+	case "pre":
+		w.boundary(2)
+		w.children(n, true)
+		w.boundary(2)
+	case "a":
+		// Foreign/malformed markup can retain nested anchors in the DOM. Never
+		// encode a token inside another token's label.
+		if w.inAnchor {
+			w.children(n, pre)
+			return
+		}
+		w.anchor(n, pre, false)
+	case "ul", "ol":
+		if len(w.lists) >= maxHTMLListDepth {
+			w.flatten(n, pre)
+			return
+		}
+		list := htmlList{ordered: n.Data == "ol", next: 1, step: 1}
+		if _, reversed := htmlAttribute(n, "reversed"); reversed && list.ordered {
+			list.next, list.step = 0, -1
+			for c := n.FirstChild; c != nil; c = c.NextSibling {
+				if c.Type == nethtml.ElementNode && c.Data == "li" {
+					list.next++
 				}
 			}
-			anchors = append(anchors, anchorFrame{href: href, startIndex: len(parts)})
+		}
+		if start, ok := htmlIntegerAttribute(n, "start"); ok {
+			list.next = start
+		}
+		w.boundary(1)
+		w.lists = append(w.lists, list)
+		w.children(n, pre)
+		w.lists = w.lists[:len(w.lists)-1]
+		w.boundary(1)
+	case "li":
+		prefix := "- "
+		if len(w.lists) > 0 {
+			list := &w.lists[len(w.lists)-1]
+			if list.ordered {
+				if value, ok := htmlIntegerAttribute(n, "value"); ok {
+					list.next = value
+				}
+				prefix = strconv.Itoa(list.next) + ". "
+				list.next += list.step
+			}
+		}
+		if w.invisible {
+			prefix = "" // A visible descendant does not reveal the item's marker.
+		}
+		text := w.fragment(n, pre, true).out.String()
+		if text != "" {
+			lines := strings.Split(text, "\n")
+			for i := 1; i < len(lines); i++ {
+				if lines[i] != "" {
+					lines[i] = strings.Repeat(" ", len(prefix)) + lines[i]
+				}
+			}
+			w.boundary(1)
+			w.append(prefix + strings.Join(lines, "\n"))
+			w.boundary(1)
+		}
+	case "tr":
+		w.boundary(1)
+		var cells []string
+		hasText := false
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			if c.Type == nethtml.ElementNode {
+				if prune, _ := htmlElementVisibility(c, w.invisible); prune {
+					continue
+				}
+			}
+			text := w.fragment(c, pre, false).out.String()
+			if text != "" || (c.Type == nethtml.ElementNode && (c.Data == "td" || c.Data == "th")) {
+				cells = append(cells, text)
+				hasText = hasText || text != ""
+			}
+		}
+		if hasText {
+			w.append(strings.Join(cells, " | "))
+		}
+		w.boundary(1)
+	default:
+		if lines := blockTags[n.Data]; lines > 0 {
+			w.boundary(lines)
+			w.children(n, pre)
+			w.boundary(lines)
+		} else {
+			w.children(n, pre)
 		}
 	}
+}
 
-	handleEnd := func(tag string) {
-		if tag == "a" && len(anchors) > 0 {
-			frame := anchors[len(anchors)-1]
-			anchors = anchors[:len(anchors)-1]
-			if frame.href != "" {
-				linkText := strings.TrimSpace(strings.Join(parts[frame.startIndex:], ""))
-				if preserveAnchorTextLinks {
-					label := linkText
-					if label == "" {
-						label = frame.href
+func (w *htmlTextWriter) anchor(n *nethtml.Node, pre, flat bool) {
+	label := w.newFragment()
+	label.inAnchor = true
+	if flat {
+		// inAnchor prevents nested anchors from creating more fragments.
+		label.flatten(n, pre)
+	} else {
+		label.children(n, pre)
+	}
+	text := label.out.String()
+	href, _ := htmlAttribute(n, "href")
+	href = safeHTMLLink(href)
+	if href != "" && (text != "" || !w.invisible) {
+		if text == "" {
+			text = href
+		}
+		if w.links {
+			text = EncodeLinkToken(text, href)
+		} else if text != href {
+			text += " <" + href + ">"
+		}
+	}
+	if label.leadingBreak > 0 {
+		w.boundary(label.leadingBreak)
+	}
+	w.space = w.space || label.leadingSpace
+	w.append(text)
+	if label.breaks > 0 {
+		w.boundary(label.breaks)
+	}
+	w.space = w.space || label.space
+}
+
+// flatten visits each remaining node once, without recursive layout fragments
+// or indentation. Anchors use one non-nesting label fragment. Visibility still
+// inherits and can be overridden by descendants.
+func (w *htmlTextWriter) flatten(n *nethtml.Node, pre bool) {
+	type visit struct {
+		node      *nethtml.Node
+		pre       bool
+		invisible bool
+		boundary  int
+	}
+	pending := []visit{{node: n, pre: pre, invisible: w.invisible}}
+	for len(pending) > 0 {
+		v := pending[len(pending)-1]
+		pending = pending[:len(pending)-1]
+		if v.node == nil {
+			w.boundary(v.boundary)
+			continue
+		}
+		n := v.node
+		lines := 0
+		switch n.Type {
+		case nethtml.TextNode:
+			if !v.invisible {
+				w.text(n.Data, v.pre)
+			}
+			continue
+		case nethtml.ElementNode:
+			prune, invisible := htmlElementVisibility(n, v.invisible)
+			if prune {
+				continue
+			}
+			v.invisible = invisible
+			switch n.Data {
+			case "a":
+				if !w.inAnchor {
+					inherited := w.invisible
+					w.invisible = v.invisible
+					w.anchor(n, v.pre, true)
+					w.invisible = inherited
+					continue
+				}
+			case "br":
+				if !v.invisible {
+					if v.pre {
+						w.append("\n")
+					} else if w.breaks < 2 {
+						w.boundary(w.breaks + 1)
 					}
-					parts = append(parts[:frame.startIndex], EncodeLinkToken(label, frame.href))
-				} else if linkText == "" {
-					parts = append(parts, frame.href)
-				} else if linkText != frame.href {
-					parts = append(parts, " <"+frame.href+">")
 				}
+				continue
+			case "hr":
+				if !v.invisible {
+					w.boundary(2)
+				}
+				continue
+			case "pre":
+				v.pre, lines = true, 2
+			case "ul", "ol", "li", "tr", "td", "th":
+				lines = 1
+			default:
+				lines = blockTags[n.Data]
 			}
+		case nethtml.DocumentNode:
+		default:
+			continue
 		}
-		if _, ok := blockTags[tag]; ok {
-			parts = append(parts, "\n")
+		if lines > 0 {
+			w.boundary(lines)
+			pending = append(pending, visit{boundary: lines})
 		}
-	}
-
-	for {
-		tt := tokenizer.Next()
-		switch tt {
-		case nethtml.ErrorToken:
-			return strings.Join(parts, "")
-		case nethtml.TextToken:
-			parts = append(parts, SanitizeLinkTokenDelimiters(string(tokenizer.Text())))
-		case nethtml.StartTagToken:
-			nameBytes, hasAttr := tokenizer.TagName()
-			tag := string(nameBytes)
-			attrs := collectAttrs(tokenizer, hasAttr)
-			handleStart(tag, attrs)
-		case nethtml.SelfClosingTagToken:
-			nameBytes, hasAttr := tokenizer.TagName()
-			tag := string(nameBytes)
-			attrs := collectAttrs(tokenizer, hasAttr)
-			handleStart(tag, attrs)
-			if tag == "a" {
-				handleEnd(tag)
-			}
-		case nethtml.EndTagToken:
-			nameBytes, _ := tokenizer.TagName()
-			handleEnd(string(nameBytes))
+		for c := n.LastChild; c != nil; c = c.PrevSibling {
+			pending = append(pending, visit{node: c, pre: v.pre, invisible: v.invisible})
 		}
 	}
 }
 
-func collectAttrs(tokenizer *nethtml.Tokenizer, hasAttr bool) []nethtml.Attribute {
-	if !hasAttr {
-		return nil
-	}
-	var attrs []nethtml.Attribute
-	for {
-		key, val, more := tokenizer.TagAttr()
-		attrs = append(attrs, nethtml.Attribute{Key: string(key), Val: string(val)})
-		if !more {
-			break
+func htmlAttribute(n *nethtml.Node, key string) (string, bool) {
+	for _, attr := range n.Attr {
+		if attr.Key == key {
+			return attr.Val, true
 		}
 	}
-	return attrs
+	return "", false
+}
+
+func htmlIntegerAttribute(n *nethtml.Node, key string) (int, bool) {
+	value, exists := htmlAttribute(n, key)
+	number, err := strconv.Atoi(strings.TrimSpace(value))
+	return number, exists && err == nil
+}
+
+var htmlCSSComments = regexp.MustCompile(`(?s)/\*.*?\*/`)
+
+// display:none and hidden prune subtrees; visibility is inherited but a visible
+// descendant can override it. Office text wrappers are transparent, unlike VML.
+func htmlElementVisibility(n *nethtml.Node, inherited bool) (prune, invisible bool) {
+	switch n.Data {
+	case "head", "title", "script", "style", "template", "xml":
+		return true, inherited
+	}
+	if strings.HasPrefix(n.Data, "v:") {
+		return true, inherited
+	}
+	if _, hidden := htmlAttribute(n, "hidden"); hidden {
+		return true, inherited
+	}
+	style, _ := htmlAttribute(n, "style")
+	if style == "" {
+		return false, inherited
+	}
+	style = htmlCSSComments.ReplaceAllString(strings.ToLower(style), "")
+	values := make(map[string]string)
+	important := make(map[string]bool)
+	for _, declaration := range strings.Split(style, ";") {
+		parts := strings.SplitN(declaration, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key, value := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+		if key != "display" && key != "visibility" {
+			continue
+		}
+		isImportant := false
+		if bang := strings.LastIndex(value, "!"); bang >= 0 && strings.TrimSpace(value[bang+1:]) == "important" {
+			isImportant = true
+			value = strings.TrimSpace(value[:bang])
+		}
+		if !important[key] || isImportant {
+			values[key], important[key] = value, isImportant
+		}
+	}
+	invisible = inherited
+	switch values["visibility"] {
+	case "hidden", "collapse":
+		invisible = true
+	case "visible", "initial":
+		invisible = false
+	}
+	return values["display"] == "none", invisible
+}
+
+// There is no trusted base URL for relative links in received email. Only emit
+// explicit web/mail links; reject controls and delimiters rather than repairing
+// an attacker-supplied scheme. Attributes have already been entity-decoded.
+func safeHTMLLink(value string) string {
+	value = strings.TrimSpace(value)
+	if strings.IndexFunc(value, func(r rune) bool {
+		return unicode.IsControl(r) || unicode.IsSpace(r) || strings.ContainsRune(linkTokenStart+linkTokenSeparator+linkTokenEnd, r)
+	}) >= 0 {
+		return ""
+	}
+	parsed, err := url.Parse(value)
+	if err != nil {
+		return ""
+	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "http", "https":
+		if parsed.Hostname() != "" {
+			return value
+		}
+	case "mailto":
+		if parsed.Opaque != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+// Only paired markers can suppress content. An unmatched/malformed revealed
+// opener must not swallow the rest of a real message. Hidden conditional
+// comments remain comments, while !mso and unknown conditions fail open.
+func filterHTMLConditionals(value string) (string, error) {
+	type frame struct {
+		start int
+		skip  bool
+	}
+	var stack []frame
+	out := make([]byte, 0, len(value))
+	tokenizer := nethtml.NewTokenizer(strings.NewReader(value))
+	for {
+		kind := tokenizer.Next()
+		start := len(out)
+		out = append(out, tokenizer.Raw()...)
+		if kind == nethtml.ErrorToken {
+			if err := tokenizer.Err(); err != io.EOF {
+				return "", err
+			}
+			return string(out), nil
+		}
+		if kind == nethtml.StartTagToken || kind == nethtml.SelfClosingTagToken {
+			name, _ := tokenizer.TagName()
+			if string(name) == "noscript" {
+				// Match the DOM parser's disabled-scripting behavior.
+				tokenizer.NextIsNotRawText()
+			}
+		}
+		if kind != nethtml.CommentToken {
+			continue
+		}
+		data := strings.ToLower(strings.TrimSpace(tokenizer.Token().Data))
+		end := strings.TrimSpace(strings.TrimPrefix(data, "<!"))
+		if strings.TrimRight(end, "-> \t\r\n") == "[endif]" {
+			if len(stack) > 0 {
+				open := stack[len(stack)-1]
+				stack = stack[:len(stack)-1]
+				if open.skip {
+					out = out[:open.start]
+				}
+			}
+			continue
+		}
+		if !strings.HasPrefix(data, "[if") {
+			continue
+		}
+		close := strings.IndexByte(data, ']')
+		if close < 4 {
+			continue
+		}
+		fields := strings.Fields(data[1:close])
+		if len(fields) < 2 || fields[0] != "if" {
+			continue
+		}
+		tail := strings.TrimSpace(data[close+1:])
+		if tail != "" && tail != ">" && tail != "><!" {
+			continue // A whole hidden conditional is a single comment, not a pair.
+		}
+		visible, known := htmlConditionalValue(data[3:close])
+		stack = append(stack, frame{start: start, skip: known && !visible})
+	}
+}
+
+var htmlOutlookCondition = regexp.MustCompile(`^(?:(?:lt|lte|gt|gte) )?(?:mso|ie)(?: [0-9.]+)?$`)
+
+// Evaluate the small boolean language used by Outlook conditional comments for
+// a non-Outlook client. Unknown syntax stays visible rather than losing mail.
+func htmlConditionalValue(condition string) (value, known bool) {
+	// Conditions in real email are tiny. Bound recursive work on untrusted input.
+	if len(condition) > 256 {
+		return false, false
+	}
+	condition = strings.Join(strings.Fields(condition), " ")
+	for _, operator := range []byte{'|', '&'} {
+		depth := 0
+		for i := 0; i < len(condition); i++ {
+			switch condition[i] {
+			case '(':
+				depth++
+			case ')':
+				depth--
+			}
+			if depth == 0 && condition[i] == operator {
+				left, lk := htmlConditionalValue(condition[:i])
+				right, rk := htmlConditionalValue(condition[i+1:])
+				if operator == '|' {
+					return left || right, (lk && rk) || (lk && left) || (rk && right)
+				}
+				return left && right, (lk && rk) || (lk && !left) || (rk && !right)
+			}
+		}
+	}
+	if strings.HasPrefix(condition, "(") && strings.HasSuffix(condition, ")") {
+		return htmlConditionalValue(condition[1 : len(condition)-1])
+	}
+	if strings.HasPrefix(condition, "!") {
+		value, known := htmlConditionalValue(condition[1:])
+		return !value, known
+	}
+	if condition == "true" {
+		return true, true
+	}
+	if condition == "false" || htmlOutlookCondition.MatchString(condition) {
+		return false, true
+	}
+	return false, false
 }
 
 func FormatTimestamp(value time.Time) string {
@@ -271,8 +784,8 @@ func FormatMailNotification(mail models.IncomingMail) string {
 }
 
 func FormatExpandedMail(mail models.ExpandedMail) string {
-	bodyText := strings.TrimSpace(mail.BodyText)
-	if bodyText == "" {
+	bodyText := mail.BodyText
+	if strings.TrimSpace(bodyText) == "" {
 		bodyText = "(no body text available)"
 	}
 	from := mail.FromHeader

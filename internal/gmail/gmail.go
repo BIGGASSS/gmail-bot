@@ -273,7 +273,10 @@ func (s *Service) GetExpandedMessage(ctx context.Context, account models.GoogleA
 	}
 	headers := extractHeaders(payload)
 	payloadPart, _ := payload["payload"].(map[string]any)
-	bodyText, attachments := ExtractBodyAndAttachments(payloadPart)
+	bodyText, attachments, err := ExtractBodyAndAttachments(payloadPart)
+	if err != nil {
+		return models.ExpandedMail{}, fmt.Errorf("extract message body: %w", err)
+	}
 	if bodyText == "" {
 		bodyText = "(no body text available)"
 	}
@@ -488,95 +491,6 @@ func internalDateToTime(value any) time.Time {
 		timestampMS = int64(v)
 	}
 	return time.UnixMilli(timestampMS).UTC()
-}
-
-// ExtractBodyAndAttachments walks a Gmail MIME payload tree.
-func ExtractBodyAndAttachments(payload map[string]any) (string, []models.AttachmentMeta) {
-	var plainParts []string
-	var htmlParts []string
-	var attachments []models.AttachmentMeta
-
-	var visit func(part map[string]any)
-	visit = func(part map[string]any) {
-		if part == nil {
-			return
-		}
-		mimeType, _ := anyString(part["mimeType"])
-		filename, _ := anyString(part["filename"])
-		body, _ := part["body"].(map[string]any)
-		if body == nil {
-			body = map[string]any{}
-		}
-		data, _ := anyString(body["data"])
-		attachmentID, _ := anyString(body["attachmentId"])
-
-		if filename != "" || attachmentID != "" {
-			size := 0
-			switch v := body["size"].(type) {
-			case float64:
-				size = int(v)
-			case string:
-				fmt.Sscan(v, &size)
-			case int:
-				size = v
-			}
-			name := filename
-			if name == "" {
-				name = "(unnamed attachment)"
-			}
-			mt := mimeType
-			if mt == "" {
-				mt = "application/octet-stream"
-			}
-			attachments = append(attachments, models.AttachmentMeta{
-				Filename: name,
-				MimeType: mt,
-				Size:     size,
-			})
-			return
-		}
-
-		if mimeType == "text/plain" && data != "" {
-			plainParts = append(plainParts, formatting.SanitizeLinkTokenDelimiters(decodeBodyData(data)))
-		} else if mimeType == "text/html" && data != "" {
-			htmlParts = append(htmlParts, formatting.HTMLToTelegramText(decodeBodyData(data)))
-		}
-
-		if children, ok := part["parts"].([]any); ok {
-			for _, child := range children {
-				if childMap, ok := child.(map[string]any); ok {
-					visit(childMap)
-				}
-			}
-		}
-	}
-
-	visit(payload)
-
-	var bodyPieces []string
-	for _, part := range plainParts {
-		trimmed := strings.TrimSpace(part)
-		if trimmed != "" {
-			bodyPieces = append(bodyPieces, trimmed)
-		}
-	}
-	bodyText := strings.Join(bodyPieces, "\n\n")
-	if bodyText == "" {
-		bodyPieces = bodyPieces[:0]
-		for _, part := range htmlParts {
-			trimmed := strings.TrimSpace(part)
-			if trimmed != "" {
-				bodyPieces = append(bodyPieces, trimmed)
-			}
-		}
-		bodyText = strings.Join(bodyPieces, "\n\n")
-	}
-
-	const maxBodyTextRunes = 50000
-	if len([]rune(bodyText)) > maxBodyTextRunes {
-		bodyText = formatting.TruncateText(bodyText, maxBodyTextRunes) + "\n\u2026 (message truncated)"
-	}
-	return bodyText, attachments
 }
 
 func decodeBodyData(data string) string {

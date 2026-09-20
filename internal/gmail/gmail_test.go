@@ -13,7 +13,7 @@ func encodeBody(value string) string {
 }
 
 func TestExtractBodyAndAttachmentsPrefersPlainText(t *testing.T) {
-	body, attachments := ExtractBodyAndAttachments(map[string]any{
+	body, attachments, err := ExtractBodyAndAttachments(map[string]any{
 		"mimeType": "multipart/mixed",
 		"parts": []any{
 			map[string]any{
@@ -30,6 +30,9 @@ func TestExtractBodyAndAttachmentsPrefersPlainText(t *testing.T) {
 			},
 		},
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if body != "Plain body" {
 		t.Fatalf("got body %q", body)
 	}
@@ -40,10 +43,13 @@ func TestExtractBodyAndAttachmentsPrefersPlainText(t *testing.T) {
 
 func TestExtractBodyAndAttachmentsTruncatesLargeBody(t *testing.T) {
 	large := strings.Repeat("x", 100000)
-	body, attachments := ExtractBodyAndAttachments(map[string]any{
+	body, attachments, err := ExtractBodyAndAttachments(map[string]any{
 		"mimeType": "text/plain",
 		"body":     map[string]any{"data": encodeBody(large)},
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(attachments) != 0 {
 		t.Fatalf("expected no attachments, got %+v", attachments)
 	}
@@ -59,10 +65,13 @@ func TestExtractBodyAndAttachmentsTruncatesLargeBody(t *testing.T) {
 func TestExtractBodyAndAttachmentsTruncatesInsideHTMLAnchor(t *testing.T) {
 	for _, prefix := range []string{"", strings.Repeat("x", 49990)} {
 		label := strings.Repeat("世界 &amp; ", 15000)
-		body, _ := ExtractBodyAndAttachments(map[string]any{
+		body, _, err := ExtractBodyAndAttachments(map[string]any{
 			"mimeType": "text/html",
 			"body":     map[string]any{"data": encodeBody(prefix + `<a href="https://example.com">` + label + `</a>`)},
 		})
+		if err != nil {
+			t.Fatal(err)
+		}
 		const marker = "\n… (message truncated)"
 		if !strings.HasSuffix(body, marker) || len([]rune(body)) > 50000+len([]rune(marker)) {
 			t.Fatal("body not capped with truncation marker")
@@ -83,10 +92,13 @@ func TestExtractBodyAndAttachmentsTruncatesInsideHTMLAnchor(t *testing.T) {
 
 func TestExtractBodyAndAttachmentsSanitizesPlainText(t *testing.T) {
 	forged := "see \ufff0aHR0cHM6Ly9ldmlsLmV4YW1wbGUuY29t\ufff1Q2xpY2sgaGVyZQ\ufff2 now"
-	body, attachments := ExtractBodyAndAttachments(map[string]any{
+	body, attachments, err := ExtractBodyAndAttachments(map[string]any{
 		"mimeType": "text/plain",
 		"body":     map[string]any{"data": encodeBody(forged)},
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(attachments) != 0 {
 		t.Fatalf("expected no attachments, got %+v", attachments)
 	}
@@ -98,12 +110,15 @@ func TestExtractBodyAndAttachmentsSanitizesPlainText(t *testing.T) {
 }
 
 func TestExtractBodyAndAttachmentsKeepsHTMLAnchorTextClickable(t *testing.T) {
-	body, attachments := ExtractBodyAndAttachments(map[string]any{
+	body, attachments, err := ExtractBodyAndAttachments(map[string]any{
 		"mimeType": "text/html",
 		"body": map[string]any{
 			"data": encodeBody(`<p><a href="https://example.com/deal?plan=pro&discount=50">Join Pro now</a></p>`),
 		},
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(attachments) != 0 {
 		t.Fatalf("expected no attachments, got %+v", attachments)
 	}
