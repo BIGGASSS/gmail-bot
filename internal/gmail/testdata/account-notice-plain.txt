@@ -1,0 +1,60 @@
+Your Google Account is ready
+
+
+
+Alex
+
+ 
+
+<!--[if !mso]><!-->
+
+<!--[if false]><!-->
+
+Hello Alex,
+
+You can now use your account to sign in.
+Keep your account details safe.
+
+
+<!--[if !mso]><!-->
+
+<!--[if false]><!-->
+
+Hello Alex,
+
+You can now use your account to sign in.
+Keep your account details safe.
+
+<!--[if false]><!-->
+
+Review your account
+
+
+<!--[if false]><!-->
+
+This reminder is intentionally repeated.
+
+This reminder is intentionally repeated.
+
+Choose a strong password.
+Keep your recovery details current.
+
+Account summary:
+Account
+Status
+alex@example.invalid
+Ready
+
+
+ 
+
+<!--[if mso]>
+<v:roundrect xmlns:v="urn:schemas-microsoft-com:vml"
+xmlns:w="urn:schemas-microsoft-com:office:word"
+href="https://accounts.example.invalid/review"
+style="height:48px;width:268px;v-text-anchor:middle;" arcsize="125%"
+stroke="false" fillcolor="#0b57d0">
+<w:anchorlock/>
+<v:textbox inset="0px,0px,0px,0px">
+
+<![endif]-->
