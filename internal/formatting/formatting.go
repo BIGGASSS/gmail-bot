@@ -164,18 +164,18 @@ func StripHTML(value string) (string, error) {
 }
 
 // HTMLToTelegramText converts email HTML to text with safe link tokens.
-// Sources over 2 MiB or 4096 '<' delimiters return ErrHTMLResourceLimit;
-// parsing failures return an error, never a partial or fallback body.
+// Sources over 2 MiB, 4096 '<' delimiters, or the conservative formatting-clone
+// budget return ErrHTMLResourceLimit. Formatting-tag preflight also caps each
+// candidate at 8 KiB and cumulative scanning at 128 KiB, including overlaps.
+// Parsing failures return an error, never a partial or fallback body.
 func HTMLToTelegramText(value string) (string, error) {
 	return extractHTMLText(value, true)
 }
 
 func extractHTMLText(value string, preserveAnchorTextLinks bool) (string, error) {
-	// Bound work BEFORE tokenization or DOM construction. The DOM parser can
-	// do quadratic work on nested/malformed markup. Counting every '<' also
-	// bounds nesting, including unclosed tags and foreign-content/raw-text
-	// ambiguities that a separate tag-balancing scanner could misinterpret.
-	// This deliberately counts delimiters in comments, attributes and text too.
+	// Bound source processing before tokenization. Count delimiters in comments,
+	// attributes and text too. These limits alone do not bound DOM allocation:
+	// HTML5 formatting reconstruction needs a separate amplification budget.
 	if len(value) > maxHTMLBytes || strings.Count(value, "<") > maxHTMLMarkup {
 		return "", ErrHTMLResourceLimit
 	}
@@ -185,6 +185,9 @@ func extractHTMLText(value string, preserveAnchorTextLinks bool) (string, error)
 	filtered, err := filterHTMLConditionals(value)
 	if err != nil {
 		return "", fmt.Errorf("filter email HTML conditionals: %w", err)
+	}
+	if err := checkHTMLCloneBudget(filtered); err != nil {
+		return "", err
 	}
 	doc, err := nethtml.ParseWithOptions(strings.NewReader(filtered), nethtml.ParseOptionEnableScripting(false))
 	if err != nil {
@@ -664,7 +667,7 @@ func filterHTMLConditionals(value string) (string, error) {
 			}
 			return string(out), nil
 		}
-		if kind == nethtml.StartTagToken {
+		if kind == nethtml.StartTagToken || kind == nethtml.SelfClosingTagToken {
 			name, _ := tokenizer.TagName()
 			if string(name) == "noscript" {
 				// Match the DOM parser's disabled-scripting behavior.
