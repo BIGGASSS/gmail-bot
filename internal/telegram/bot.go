@@ -310,25 +310,15 @@ func (b *Bot) handleReloginReminder(ctx context.Context, message *tgbotapi.Messa
 }
 
 func (b *Bot) handleLogout(ctx context.Context, message *tgbotapi.Message) {
-	// Invalidate pending login links even when no account is connected.
-	if err := b.database.DeleteOAuthStatesForUser(ctx, message.From.ID); err != nil {
-		applog.Errorf("Failed to clear OAuth states on logout: %v", err)
-		b.reply(message.Chat.ID, "Couldn't disconnect safely. Please retry /logout.")
-		return
-	}
-	account, err := b.database.GetGoogleAccount(ctx, message.From.ID)
+	// Invalidate in-flight login callbacks even when no account is connected.
+	account, err := b.database.Logout(ctx, message.From.ID)
 	if err != nil {
-		applog.Errorf("Failed to load account for /logout: %v", err)
+		applog.Errorf("Failed to disconnect account for /logout: %v", err)
+		b.reply(message.Chat.ID, "Couldn't disconnect safely. Please retry /logout.")
 		return
 	}
 	if account == nil {
 		b.reply(message.Chat.ID, "No Gmail account is currently connected.")
-		return
-	}
-	// Honor local disconnect immediately, independent of Google's availability.
-	if err := b.database.DeleteGoogleAccount(ctx, message.From.ID); err != nil {
-		applog.Errorf("Failed to delete Google account: %v", err)
-		b.reply(message.Chat.ID, "Couldn't disconnect locally. Please retry /logout.")
 		return
 	}
 	if err := b.oauthClient.RevokeToken(ctx, account.RefreshToken); err != nil {

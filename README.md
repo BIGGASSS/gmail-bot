@@ -74,7 +74,7 @@ go test ./...
 
 Unauthorized Telegram users are ignored and logged.
 
-Login links are sent only in private chat. Start a private chat with the bot before using `/login` from a group. Starting a new login invalidates earlier links; `/logout` invalidates pending links even if no account is connected. To refresh an existing Gmail connection, send `/logout`, then `/login`. Forwarding stops until that login succeeds.
+Login links are sent only in private chat. Start a private chat with the bot before using `/login` from a group. Starting a new login invalidates earlier links, including callbacks already in flight; `/logout` invalidates pending links even if no account is connected. To refresh an existing Gmail connection, send `/logout`, then `/login`. Forwarding stops until that login succeeds.
 
 `/logout` removes the local connection even if Google token revocation fails. In that case, the bot asks you to revoke access manually at https://myaccount.google.com/connections. Work already in progress may still complete.
 
@@ -84,4 +84,4 @@ Expanded messages prefer clean plain text within each MIME alternative group. If
 
 SQLite database files and existing WAL/shared-memory sidecars must allow owner-only permissions (`0600`); startup fails if these permissions cannot be enforced. Newly created database directories use `0700`. No new environment variables are required.
 
-Databases created while `/relog` existed keep unused `auth_versions`, `oauth_attempts`, and `pending_relogs` tables, plus `google_accounts.generation`. Startup leaves those objects in place. An in-flight `/relog` link is rejected and does not replace credentials; send `/logout`, then `/login`.
+`auth_versions`, `oauth_attempts`, and `google_accounts.generation` let logout and a newer `/login` reject a callback that already consumed its link, and they keep background token refreshes from writing over a replacement account. `pending_relogs` stays unused so existing databases are not altered destructively. An in-flight `/relog` link is rejected and does not replace credentials; send `/logout`, then `/login`.

@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"github.com/BIGGASSS/gmail-bot/internal/applog"
+	"github.com/BIGGASSS/gmail-bot/internal/models"
 	"html"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/BIGGASSS/gmail-bot/internal/database"
@@ -146,7 +148,7 @@ func (s *Server) handleGoogleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.completeLogin(r.Context(), oauthState.TelegramUserID, oauthState.CreatedAt, code); err != nil {
+	if err := s.completeLogin(r.Context(), *oauthState, code); err != nil {
 		applog.Errorf("Failed to complete Gmail OAuth callback for Telegram user %d: %v", oauthState.TelegramUserID, err)
 		_ = s.notifier.SendLoginFailure(r.Context(), oauthState.TelegramUserID, err.Error())
 		writeHTML(w, http.StatusInternalServerError, "<html><body><h1>Gmail connection failed.</h1><p>Return to Telegram for details.</p></body></html>")
@@ -156,7 +158,8 @@ func (s *Server) handleGoogleCallback(w http.ResponseWriter, r *http.Request) {
 	writeHTML(w, http.StatusOK, "<html><body><h1>Gmail connected.</h1><p>You can return to Telegram.</p></body></html>")
 }
 
-func (s *Server) completeLogin(ctx context.Context, telegramUserID int64, stateCreatedAt time.Time, code string) error {
+func (s *Server) completeLogin(ctx context.Context, state models.OAuthState, code string) error {
+	telegramUserID, stateCreatedAt := state.TelegramUserID, state.CreatedAt
 	existingAccount, err := s.database.GetGoogleAccount(ctx, telegramUserID)
 	if err != nil {
 		return err
@@ -172,12 +175,13 @@ func (s *Server) completeLogin(ctx context.Context, telegramUserID int64, stateC
 	}
 
 	refreshToken := ""
-	if tokenResponse.RefreshToken != nil {
+	reusedRefresh := tokenResponse.RefreshToken == nil || strings.TrimSpace(*tokenResponse.RefreshToken) == ""
+	if tokenResponse.RefreshToken != nil && strings.TrimSpace(*tokenResponse.RefreshToken) != "" {
 		refreshToken = *tokenResponse.RefreshToken
 	} else if existingAccount != nil {
 		refreshToken = existingAccount.RefreshToken
 	}
-	if refreshToken == "" {
+	if strings.TrimSpace(refreshToken) == "" {
 		return &oauth.OAuthError{Message: "Google did not return a refresh token."}
 	}
 
@@ -185,9 +189,12 @@ func (s *Server) completeLogin(ctx context.Context, telegramUserID int64, stateC
 	if err != nil {
 		return err
 	}
+	if reusedRefresh && existingAccount != nil && !strings.EqualFold(strings.TrimSpace(existingAccount.GmailEmail), strings.TrimSpace(profile.EmailAddress)) {
+		return &oauth.OAuthError{Message: "Google did not return a refresh token for this account. Retry /login with consent."}
+	}
 
 	connectedAt := database.UTCNow()
-	if err := s.database.UpsertGoogleAccount(ctx, database.UpsertGoogleAccountParams{
+	if err := s.database.CompleteOAuth(ctx, state, database.UpsertGoogleAccountParams{
 		TelegramUserID:         telegramUserID,
 		GmailEmail:             profile.EmailAddress,
 		AccessToken:            tokenResponse.AccessToken,

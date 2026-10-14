@@ -7,6 +7,7 @@ const DefaultReloginPromptDelayDays = 6
 var ManualReloginPromptDelay = time.Duration(DefaultReloginPromptDelayDays) * 24 * time.Hour
 
 type OAuthState struct {
+	Generation     int64
 	State          string
 	TelegramUserID int64
 	CreatedAt      time.Time
@@ -14,6 +15,7 @@ type OAuthState struct {
 }
 
 type GoogleAccount struct {
+	Generation             int64
 	TelegramUserID         int64
 	GmailEmail             string
 	AccessToken            string

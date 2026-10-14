@@ -51,7 +51,7 @@ func TestConsumeRetiredRelogDoesNotReturnLoginState(t *testing.T) {
 	if err := db.StoreOAuthState(ctx, "relog-state", 7, expiresAt); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.db.ExecContext(ctx, `INSERT INTO oauth_attempts (state, generation, relog) VALUES (?, ?, ?)`, "relog-state", 1, 1); err != nil {
+	if _, err := db.db.ExecContext(ctx, `UPDATE oauth_attempts SET relog = 1 WHERE state = ?`, "relog-state"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -73,9 +73,6 @@ func TestConsumeLegacyLoginAttemptStillSucceeds(t *testing.T) {
 	db := openTestDB(t)
 	defer db.Close()
 	if err := db.StoreOAuthState(ctx, "login-state", 7, UTCNow().Add(15*time.Minute)); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.db.ExecContext(ctx, `INSERT INTO oauth_attempts (state, generation, relog) VALUES (?, ?, ?)`, "login-state", 0, 0); err != nil {
 		t.Fatal(err)
 	}
 	state, err := db.ConsumeOAuthState(ctx, "login-state")
