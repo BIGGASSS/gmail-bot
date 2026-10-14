@@ -393,9 +393,8 @@ func (s *Service) forceRefresh(ctx context.Context, account models.GoogleAccount
 			if err != nil {
 				return models.GoogleAccount{}, err
 			}
-			// Another ordinary refresh may have won the token CAS. Reuse its
-			// credentials, but never cross a logout/reauthorization boundary
-			// or replace this operation's cursor and other snapshot metadata.
+			// Another refresh of this same authorization may have won. Reuse its
+			// credentials without taking its cursor or crossing a login/logout boundary.
 			if current != nil && current.Generation == account.Generation && current.TokenExpiry.After(time.Now().UTC()) {
 				account.AccessToken, account.RefreshToken, account.TokenExpiry = current.AccessToken, current.RefreshToken, current.TokenExpiry
 				return account, nil

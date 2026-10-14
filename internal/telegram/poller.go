@@ -158,11 +158,6 @@ func (p *GmailPoller) SendManualReloginPromptIfDue(ctx context.Context, account 
 		applog.Errorf("Failed to send manual Gmail reconnect prompt to Telegram user %d: %v", account.TelegramUserID, err)
 		return nil
 	}
-	if guarded, ok := p.database.(interface {
-		MarkReloginPromptSentGuarded(context.Context, models.GoogleAccount) error
-	}); ok {
-		return guarded.MarkReloginPromptSentGuarded(ctx, account)
-	}
 	return p.database.MarkReloginPromptSent(ctx, account.TelegramUserID, nil)
 }
 

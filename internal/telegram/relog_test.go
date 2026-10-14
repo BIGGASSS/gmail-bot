@@ -9,80 +9,111 @@ import (
 	"github.com/BIGGASSS/gmail-bot/internal/database"
 )
 
-func TestRelogCommandPrivateLinkKeepsConnection(t *testing.T) {
+func TestRelogCommandAsksForLogoutThenLogin(t *testing.T) {
 	ctx := context.Background()
 	db := openTelegramTestDB(t)
-	api := &fakeUpdateClient{}
-	revoker := &fakeRevoker{}
-	bot := newTestBot(t, api, revoker, db)
-	bot.HandleUpdate(ctx, commandUpdate(1, 1, "/relog"))
-	if texts := api.texts(); len(texts) != 1 || !strings.Contains(texts[0], "/login") {
-		t.Fatalf("missing login guidance: %v", texts)
-	}
 	now := database.UTCNow()
-	if err := db.UpsertGoogleAccount(ctx, database.UpsertGoogleAccountParams{TelegramUserID: 1, GmailEmail: "user@example.com", AccessToken: "access", RefreshToken: "refresh", TokenExpiry: now, ConnectedAt: now, LastHistoryID: "123"}); err != nil {
+	if err := db.UpsertGoogleAccount(ctx, database.UpsertGoogleAccountParams{
+		TelegramUserID: 1,
+		GmailEmail:     "user@example.com",
+		AccessToken:    "access",
+		RefreshToken:   "refresh",
+		TokenExpiry:    now,
+		ConnectedAt:    now,
+		LastHistoryID:  "123",
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.StoreOAuthState(ctx, "previous", 1, now.Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
-	api = &fakeUpdateClient{}
-	bot = newTestBot(t, api, revoker, db)
+	api := &fakeUpdateClient{}
+	revoker := &fakeRevoker{}
+	bot := newTestBot(t, api, revoker, db)
 	bot.HandleUpdate(ctx, commandUpdate(1, -100, "/relog"))
-	private, group := api.messagesForChat(1), api.messagesForChat(-100)
-	if len(private) != 1 || !strings.Contains(private[0], "15 minutes") || !strings.Contains(private[0], "Forwarding stays active") {
-		t.Fatalf("private reply: %v", private)
+
+	texts := api.texts()
+	if len(texts) != 1 || !strings.Contains(texts[0], "/logout") || !strings.Contains(texts[0], "/login") {
+		t.Fatalf("reply: %v", texts)
 	}
-	if len(group) != 1 || strings.Contains(group[0], "https://") {
-		t.Fatalf("link leaked: %v", group)
+	if strings.Contains(texts[0], "https://") || strings.Contains(texts[0], "Forwarding stays active") {
+		t.Fatalf("relog still started oauth: %v", texts)
 	}
-	stateText := strings.Split(strings.Split(private[0], "state=")[1], "\"")[0]
-	state, err := db.ConsumeOAuthState(ctx, stateText)
-	if err != nil || state == nil || !state.Relog {
-		t.Fatalf("missing relog state %q: %+v %v", stateText, state, err)
+	state, err := db.ConsumeOAuthState(ctx, "previous")
+	if err != nil || state == nil {
+		t.Fatal("relog consumed or invalidated the existing login link")
 	}
-	if state.ExpiresAt.Sub(state.CreatedAt) > 15*time.Minute || state.ExpiresAt.Sub(state.CreatedAt) < 14*time.Minute {
-		t.Fatal("wrong expiration")
-	}
-	old, err := db.ConsumeOAuthState(ctx, "previous")
-	if err != nil || old != nil {
-		t.Fatal("old login still valid")
-	}
-	a, err := db.GetGoogleAccount(ctx, 1)
-	if err != nil || a == nil || a.AccessToken != "access" || a.LastHistoryID != "123" {
-		t.Fatal("relog start changed account")
+	account, err := db.GetGoogleAccount(ctx, 1)
+	if err != nil || account == nil || account.AccessToken != "access" || account.LastHistoryID != "123" {
+		t.Fatal("relog changed the connected account")
 	}
 	if len(revoker.revoked) != 0 {
 		t.Fatal("relog revoked tokens")
 	}
 }
 
-func TestStaleInvalidGrantDoesNotNotifyOrDelete(t *testing.T) {
+func TestStaleInvalidGrantKeepsReplacementLogin(t *testing.T) {
 	ctx := context.Background()
 	db := openTelegramTestDB(t)
 	now := database.UTCNow()
-	p := database.UpsertGoogleAccountParams{TelegramUserID: 1, GmailEmail: "user@example.com", AccessToken: "old", RefreshToken: "refresh", TokenExpiry: now, ConnectedAt: now, LastHistoryID: "123"}
-	if err := db.UpsertGoogleAccount(ctx, p); err != nil {
+	if err := db.UpsertGoogleAccount(ctx, database.UpsertGoogleAccountParams{
+		TelegramUserID: 1,
+		GmailEmail:     "old@example.com",
+		AccessToken:    "old",
+		RefreshToken:   "old-refresh",
+		TokenExpiry:    now,
+		ConnectedAt:    now,
+		LastHistoryID:  "1",
+	}); err != nil {
 		t.Fatal(err)
 	}
-	old, _ := db.GetGoogleAccount(ctx, 1)
-	p.AccessToken = "new"
-	if err := db.UpsertGoogleAccount(ctx, p); err != nil {
+	old, err := db.GetGoogleAccount(ctx, 1)
+	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := db.Logout(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.StoreOAuthAttempt(ctx, "login", 1, now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	state, err := db.ConsumeOAuthState(ctx, "login")
+	if err != nil || state == nil {
+		t.Fatal(err)
+	}
+	if err := db.CompleteOAuth(ctx, *state, database.UpsertGoogleAccountParams{
+		TelegramUserID: 1,
+		GmailEmail:     "new@example.com",
+		AccessToken:    "new",
+		RefreshToken:   "new-refresh",
+		TokenExpiry:    now.Add(time.Hour),
+		ConnectedAt:    now,
+		LastHistoryID:  "2",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkMessageDelivered(ctx, 1, "msg", 1, 9); err != nil {
+		t.Fatal(err)
+	}
+
 	notifier := &dummyNotifier{}
 	poller := NewGmailPoller(StaticPollerSettings{}, db, nil, notifier)
 	poller.HandleInvalidGrant(ctx, *old, nil)
 	if len(notifier.reloginRequests) != 0 {
-		t.Fatal("sent misleading expiration notification")
+		t.Fatal("stale invalid_grant notified the user")
 	}
-	a, err := db.GetGoogleAccount(ctx, 1)
-	if err != nil || a == nil || a.AccessToken != "new" {
-		t.Fatal("deleted refreshed account")
+	account, err := db.GetGoogleAccount(ctx, 1)
+	if err != nil || account == nil || account.AccessToken != "new" || account.GmailEmail != "new@example.com" {
+		t.Fatalf("replacement removed: %+v %v", account, err)
 	}
-	poller.HandleInvalidGrant(ctx, *a, nil)
-	a, err = db.GetGoogleAccount(ctx, 1)
-	if err != nil || a != nil || len(notifier.reloginRequests) != 1 {
-		t.Fatal("current invalid_grant not handled")
+	delivered, err := db.WasMessageDelivered(ctx, 1, "msg")
+	if err != nil || !delivered {
+		t.Fatalf("delivery records removed: %v %v", delivered, err)
+	}
+
+	poller.HandleInvalidGrant(ctx, *account, nil)
+	account, err = db.GetGoogleAccount(ctx, 1)
+	if err != nil || account != nil || len(notifier.reloginRequests) != 1 {
+		t.Fatal("current invalid_grant was not applied")
 	}
 }

@@ -11,26 +11,21 @@ import (
 )
 
 // ErrStaleAuthorization means a snapshot or OAuth attempt no longer owns the authorization.
-// Generations advance on authorization replacement/logout, not ordinary token refresh.
-// auth_versions is retained after account deletion to prevent generation reuse.
-var ErrStaleAuthorization = errors.New("Authorization changed or link expired. Please request a new /login or /relog link.")
+// Generations advance when credentials are replaced or the user logs out, not on an ordinary token refresh.
+// auth_versions is retained after account deletion so a generation is not reused.
+var ErrStaleAuthorization = errors.New("Authorization changed or link expired. Please request a new /login link.")
 
-// StoreOAuthAttempt supersedes even callbacks that have already consumed their state.
-func (d *Database) StoreOAuthAttempt(ctx context.Context, state string, user int64, expires time.Time, relog bool) error {
+// StoreOAuthAttempt records the latest login link and supersedes callbacks that already consumed an older state.
+func (d *Database) StoreOAuthAttempt(ctx context.Context, state string, user int64, expires time.Time) error {
 	tx, err := d.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	var generation int64
-	if relog {
-		if err := tx.QueryRowContext(ctx, `SELECT generation FROM google_accounts WHERE telegram_user_id = ?`, user).Scan(&generation); err != nil {
-			return err
-		}
-	}
 	if _, err = tx.ExecContext(ctx, `INSERT INTO auth_versions (telegram_user_id) VALUES (?) ON CONFLICT DO NOTHING`, user); err != nil {
 		return err
 	}
+	var generation int64
 	if err = tx.QueryRowContext(ctx, `SELECT generation FROM auth_versions WHERE telegram_user_id = ?`, user).Scan(&generation); err != nil {
 		return err
 	}
@@ -40,24 +35,16 @@ func (d *Database) StoreOAuthAttempt(ctx context.Context, state string, user int
 	if _, err = tx.ExecContext(ctx, `DELETE FROM oauth_states WHERE telegram_user_id = ?`, user); err != nil {
 		return err
 	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO oauth_states VALUES (?, ?, ?, ?)`, state, user, ToISO8601(UTCNow()), ToISO8601(expires)); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO oauth_states (state, telegram_user_id, created_at, expires_at) VALUES (?, ?, ?, ?)`, state, user, ToISO8601(UTCNow()), ToISO8601(expires)); err != nil {
 		return err
 	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO oauth_attempts VALUES (?, ?, ?)`, state, generation, relog); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO oauth_attempts (state, generation, relog) VALUES (?, ?, 0)`, state, generation); err != nil {
 		return err
-	}
-	if _, err = tx.ExecContext(ctx, `DELETE FROM pending_relogs WHERE telegram_user_id = ?`, user); err != nil {
-		return err
-	}
-	if relog {
-		if _, err = tx.ExecContext(ctx, `INSERT INTO pending_relogs (telegram_user_id, state, generation, expires_at) VALUES (?, ?, ?, ?)`, user, state, generation, ToISO8601(expires)); err != nil {
-			return err
-		}
 	}
 	return tx.Commit()
 }
 
-// CompleteOAuth commits only the latest, unexpired attempt against its original authorization.
+// CompleteOAuth writes credentials only when state is still the latest unexpired attempt for its generation.
 func (d *Database) CompleteOAuth(ctx context.Context, state models.OAuthState, p UpsertGoogleAccountParams) error {
 	if p.TelegramUserID != state.TelegramUserID {
 		return ErrStaleAuthorization
@@ -81,30 +68,13 @@ func (d *Database) CompleteOAuth(ctx context.Context, state models.OAuthState, p
 	if strings.TrimSpace(p.RefreshToken) == "" {
 		return errors.New("Google did not return a refresh token. Please retry with consent.")
 	}
-	if state.Relog {
-		var email string
-		var days int
-		if err := tx.QueryRowContext(ctx, `SELECT gmail_email, relogin_prompt_delay_days FROM google_accounts WHERE telegram_user_id = ? AND generation = ?`, state.TelegramUserID, state.Generation).Scan(&email, &days); err != nil {
-			return ErrStaleAuthorization
-		}
-		if !strings.EqualFold(strings.TrimSpace(email), strings.TrimSpace(p.GmailEmail)) {
-			return errors.New("Choose the Gmail account already connected to the bot, then retry /relog.")
-		}
-		now := UTCNow()
-		_, err = tx.ExecContext(ctx, `UPDATE google_accounts SET access_token = ?, refresh_token = ?, token_expiry = ?, generation = generation + 1, relogin_prompt_base_at = ?, relogin_prompt_due_at = ?, relogin_prompt_sent_at = NULL, updated_at = ? WHERE telegram_user_id = ?`, p.AccessToken, p.RefreshToken, ToISO8601(p.TokenExpiry), ToISO8601(now), ToISO8601(now.Add(time.Duration(days)*24*time.Hour)), ToISO8601(now), state.TelegramUserID)
-		if err != nil {
-			return err
-		}
-		_, err = tx.ExecContext(ctx, `UPDATE auth_versions SET generation = generation + 1 WHERE telegram_user_id = ?`, state.TelegramUserID)
-	} else {
-		err = upsertAccount(ctx, tx, p)
-	}
-	if err != nil {
+	if err = upsertAccount(ctx, tx, p); err != nil {
 		return err
 	}
 	return tx.Commit()
 }
 
+// UpdateTokensGuarded stores a refresh only when the row is still the snapshot that requested it.
 func (d *Database) UpdateTokensGuarded(ctx context.Context, a models.GoogleAccount, access string, expiry time.Time, refresh *string) error {
 	result, err := d.db.ExecContext(ctx, `UPDATE google_accounts SET access_token = ?, refresh_token = COALESCE(?, refresh_token), token_expiry = ?, updated_at = ? WHERE telegram_user_id = ? AND generation = ? AND access_token = ? AND refresh_token = ?`, access, refresh, ToISO8601(expiry), ToISO8601(UTCNow()), a.TelegramUserID, a.Generation, a.AccessToken, a.RefreshToken)
 	if err != nil {
@@ -120,21 +90,14 @@ func (d *Database) UpdateTokensGuarded(ctx context.Context, a models.GoogleAccou
 	return nil
 }
 
-// DeleteGoogleAccountGuarded handles automatic invalid_grant cleanup, not logout.
-// An active relog owns the chance to replace expired credentials without losing
-// account metadata or cascading deletion of delivery records. Its protection is
-// durable across state consumption/restarts, but bounded by the link's expiry.
+// DeleteGoogleAccountGuarded removes an account only when the expired snapshot still owns it.
+// Logout and a newer login change the generation or tokens, so a delayed invalid_grant cannot
+// delete the replacement account or its delivery records.
 func (d *Database) DeleteGoogleAccountGuarded(ctx context.Context, a models.GoogleAccount) (bool, error) {
 	result, err := d.db.ExecContext(ctx, `
 DELETE FROM google_accounts
 WHERE telegram_user_id = ? AND generation = ? AND refresh_token = ? AND access_token = ?
-AND NOT EXISTS (
-    SELECT 1 FROM pending_relogs r
-    JOIN auth_versions v ON v.telegram_user_id = r.telegram_user_id
-        AND v.attempt = r.state AND v.generation = r.generation
-    WHERE r.telegram_user_id = google_accounts.telegram_user_id
-        AND r.generation = google_accounts.generation AND r.expires_at > ?
-)`, a.TelegramUserID, a.Generation, a.RefreshToken, a.AccessToken, ToISO8601(UTCNow()))
+`, a.TelegramUserID, a.Generation, a.RefreshToken, a.AccessToken)
 	if err != nil {
 		return false, err
 	}
@@ -142,7 +105,7 @@ AND NOT EXISTS (
 	return n == 1, err
 }
 
-// Logout atomically invalidates in-flight callbacks and removes local credentials.
+// Logout atomically invalidates in-flight login callbacks and removes local credentials.
 func (d *Database) Logout(ctx context.Context, user int64) (*models.GoogleAccount, error) {
 	tx, err := d.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -171,12 +134,4 @@ func (d *Database) Logout(ctx context.Context, user int64) (*models.GoogleAccoun
 		return nil, nil
 	}
 	return &models.GoogleAccount{TelegramUserID: user, GmailEmail: email, RefreshToken: refresh}, nil
-}
-
-func (d *Database) MarkReloginPromptSentGuarded(ctx context.Context, a models.GoogleAccount) error {
-	if a.ReloginPromptDueAt == nil {
-		return nil
-	}
-	_, err := d.db.ExecContext(ctx, `UPDATE google_accounts SET relogin_prompt_sent_at = ? WHERE telegram_user_id = ? AND generation = ? AND relogin_prompt_due_at = ?`, ToISO8601(UTCNow()), a.TelegramUserID, a.Generation, ToISO8601(*a.ReloginPromptDueAt))
-	return err
 }

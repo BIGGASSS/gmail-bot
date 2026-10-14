@@ -8,7 +8,6 @@ var ManualReloginPromptDelay = time.Duration(DefaultReloginPromptDelayDays) * 24
 
 type OAuthState struct {
 	Generation     int64
-	Relog          bool
 	State          string
 	TelegramUserID int64
 	CreatedAt      time.Time
