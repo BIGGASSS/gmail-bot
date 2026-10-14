@@ -133,7 +133,7 @@ func (b *Bot) handleMessage(ctx context.Context, message *tgbotapi.Message) {
 	case "help":
 		b.handleHelp(ctx, message)
 	case "relog":
-		b.handleRelog(ctx, message)
+		b.reply(message.Chat.ID, "The /relog command has been removed. To refresh Gmail authorization, send /logout, then /login.")
 	case "login":
 		b.handleLogin(ctx, message)
 	case "status":
@@ -169,7 +169,6 @@ func (b *Bot) handleHelp(ctx context.Context, message *tgbotapi.Message) {
 		"Available commands:",
 		"/start - basic status",
 		"/login - connect your Gmail account",
-		"/relog - refresh authorization without interrupting forwarding",
 		"/status - show Gmail connection status",
 		"/relogin_reminder [on|off|days N] - configure the manual reconnect reminder",
 		"/logout - disconnect Gmail",
@@ -177,24 +176,7 @@ func (b *Bot) handleHelp(ctx context.Context, message *tgbotapi.Message) {
 	}, "\n"))
 }
 
-func (b *Bot) handleRelog(ctx context.Context, message *tgbotapi.Message) {
-	account, err := b.database.GetGoogleAccount(ctx, message.From.ID)
-	if err != nil {
-		b.reply(message.Chat.ID, "Couldn't load Gmail connection. Please retry.")
-		return
-	}
-	if account == nil {
-		b.reply(message.Chat.ID, "No Gmail account is connected. Use /login to connect one.")
-		return
-	}
-	b.sendOAuthLink(ctx, message, true)
-}
-
 func (b *Bot) handleLogin(ctx context.Context, message *tgbotapi.Message) {
-	b.sendOAuthLink(ctx, message, false)
-}
-
-func (b *Bot) sendOAuthLink(ctx context.Context, message *tgbotapi.Message, relog bool) {
 	state, err := newOAuthState()
 	if err != nil {
 		applog.Errorf("Failed to generate OAuth state: %v", err)
@@ -204,18 +186,16 @@ func (b *Bot) sendOAuthLink(ctx context.Context, message *tgbotapi.Message, relo
 		applog.Errorf("Failed to cleanup OAuth states: %v", err)
 	}
 	expiresAt := database.UTCNow().Add(15 * time.Minute)
-	if err := b.database.StoreOAuthAttempt(ctx, state, message.From.ID, expiresAt, relog); err != nil {
+	if err := b.database.DeleteOAuthStatesForUser(ctx, message.From.ID); err != nil {
+		applog.Errorf("Failed to clear stale OAuth states: %v", err)
+	}
+	if err := b.database.StoreOAuthState(ctx, state, message.From.ID, expiresAt); err != nil {
 		applog.Errorf("Failed to store OAuth state: %v", err)
-		b.reply(message.Chat.ID, "Couldn't create an authorization link. Check /status and retry.")
 		return
 	}
 	authURL := b.oauthClient.BuildAuthorizationURL(state)
-	intro := "Open this link to connect Gmail:"
-	if relog {
-		intro = "Open this link to refresh Gmail authorization. Choose the same Gmail account and grant consent. Forwarding stays active; your cursor and reminder preferences are preserved:"
-	}
 	text := formatting.RenderTelegramHTML(strings.Join([]string{
-		intro,
+		"Open this link to connect Gmail:",
 		authURL,
 		"",
 		"The login link expires in 15 minutes.",
@@ -227,11 +207,7 @@ func (b *Bot) sendOAuthLink(ctx context.Context, message *tgbotapi.Message, relo
 		applog.Errorf("Failed to send login link: %v", err)
 		// If private send fails and we're in a group, tell the user to start the bot privately
 		if message.Chat.ID != message.From.ID {
-			command := "/login"
-			if relog {
-				command = "/relog"
-			}
-			b.reply(message.Chat.ID, "I couldn't send you the login link in a private message. Please start a private chat with me first (send /start to me directly), then use "+command+" again.")
+			b.reply(message.Chat.ID, "I couldn't send you the login link in a private message. Please start a private chat with me first (send /start to me directly), then use /login again.")
 		}
 		return
 	}
@@ -334,14 +310,25 @@ func (b *Bot) handleReloginReminder(ctx context.Context, message *tgbotapi.Messa
 }
 
 func (b *Bot) handleLogout(ctx context.Context, message *tgbotapi.Message) {
-	account, err := b.database.Logout(ctx, message.From.ID)
-	if err != nil {
-		applog.Errorf("Failed to disconnect account for /logout: %v", err)
+	// Invalidate pending login links even when no account is connected.
+	if err := b.database.DeleteOAuthStatesForUser(ctx, message.From.ID); err != nil {
+		applog.Errorf("Failed to clear OAuth states on logout: %v", err)
 		b.reply(message.Chat.ID, "Couldn't disconnect safely. Please retry /logout.")
+		return
+	}
+	account, err := b.database.GetGoogleAccount(ctx, message.From.ID)
+	if err != nil {
+		applog.Errorf("Failed to load account for /logout: %v", err)
 		return
 	}
 	if account == nil {
 		b.reply(message.Chat.ID, "No Gmail account is currently connected.")
+		return
+	}
+	// Honor local disconnect immediately, independent of Google's availability.
+	if err := b.database.DeleteGoogleAccount(ctx, message.From.ID); err != nil {
+		applog.Errorf("Failed to delete Google account: %v", err)
+		b.reply(message.Chat.ID, "Couldn't disconnect locally. Please retry /logout.")
 		return
 	}
 	if err := b.oauthClient.RevokeToken(ctx, account.RefreshToken); err != nil {

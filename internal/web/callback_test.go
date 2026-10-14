@@ -2,13 +2,17 @@ package web
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	_ "modernc.org/sqlite"
 
 	"github.com/BIGGASSS/gmail-bot/internal/config"
 	"github.com/BIGGASSS/gmail-bot/internal/database"
@@ -127,7 +131,7 @@ func TestCallbackReusesExistingRefreshToken(t *testing.T) {
 	})
 	mux.HandleFunc("/gmail/v1/users/me/profile", func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"emailAddress": "old@example.com",
+			"emailAddress": "new@example.com",
 			"historyId":    "99",
 		})
 	})
@@ -148,7 +152,7 @@ func TestCallbackReusesExistingRefreshToken(t *testing.T) {
 	if account.RefreshToken != "existing-refresh" {
 		t.Fatalf("refresh token lost: %q", account.RefreshToken)
 	}
-	if account.AccessToken != "new-access" || account.GmailEmail != "old@example.com" {
+	if account.AccessToken != "new-access" || account.GmailEmail != "new@example.com" {
 		t.Fatalf("account not updated: %+v", account)
 	}
 }
@@ -188,6 +192,81 @@ func TestCallbackMissingRefreshTokenFails(t *testing.T) {
 	}
 	if account != nil {
 		t.Fatal("expected no account on failure")
+	}
+}
+
+func TestCallbackRejectsRetiredRelogWithoutReplacingAccount(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "bot.db")
+	db, err := database.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if err := db.Initialize(ctx); err != nil {
+		t.Fatal(err)
+	}
+	now := database.UTCNow()
+	if err := db.UpsertGoogleAccount(ctx, database.UpsertGoogleAccountParams{
+		TelegramUserID:         42,
+		GmailEmail:             "user@example.com",
+		AccessToken:            "old-access",
+		RefreshToken:           "old-refresh",
+		TokenExpiry:            now.Add(time.Hour),
+		LastHistoryID:          "10",
+		ConnectedAt:            now.Add(-24 * time.Hour),
+		ReloginPromptEnabled:   true,
+		ReloginPromptDelayDays: 6,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.StoreOAuthState(ctx, "relog-state", 42, now.Add(15*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	side, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = side.Close() })
+	if _, err := side.ExecContext(ctx, `INSERT INTO oauth_attempts (state, generation, relog) VALUES (?, ?, ?)`, "relog-state", 3, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	tokenCalls := 0
+	mux := http.NewServeMux()
+	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
+		tokenCalls++
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"access_token":  "new-access",
+			"refresh_token": "new-refresh",
+			"expires_in":    3600,
+		})
+	})
+	upstream := httptest.NewServer(mux)
+	defer upstream.Close()
+
+	notifier := &captureNotifier{}
+	server := newServerWithUpstream(t, db, notifier, upstream.URL)
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/oauth/google/callback?state=relog-state&code=code", nil))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "/logout") || !strings.Contains(rec.Body.String(), "/login") {
+		t.Fatalf("body=%s", rec.Body.String())
+	}
+	if tokenCalls != 0 {
+		t.Fatalf("token endpoint calls=%d", tokenCalls)
+	}
+	if len(notifier.failures) != 1 || !strings.Contains(notifier.failures[0], "/logout") {
+		t.Fatalf("failures=%v", notifier.failures)
+	}
+	account, err := db.GetGoogleAccount(ctx, 42)
+	if err != nil || account == nil {
+		t.Fatal(err)
+	}
+	if account.AccessToken != "old-access" || account.RefreshToken != "old-refresh" || account.LastHistoryID != "10" {
+		t.Fatalf("account changed: %+v", account)
 	}
 }
 
