@@ -27,6 +27,21 @@ func TestNormalizePlainText(t *testing.T) {
 	}
 }
 
+func TestLinkTokenLabels(t *testing.T) {
+	for _, tt := range []struct{ name, input, want string }{
+		{"plain text", "Use <div> &amp; literal text", "Use <div> &amp; literal text"},
+		{"visible label", "Before " + EncodeLinkToken("ExampleCloud", "https://example.invalid") + " after", "Before ExampleCloud after"},
+		{"Unicode and multiple links", EncodeLinkToken("世界 & <cloud>", "https://example.invalid") + "\n" + EncodeLinkToken("Support", "mailto:support@example.invalid"), "世界 & <cloud>\nSupport"},
+		{"invalid label encoding", "\ufff0a\ufff1aHR0cHM6Ly9leGFtcGxlLmludmFsaWQ\ufff2", "\ufff0a\ufff1aHR0cHM6Ly9leGFtcGxlLmludmFsaWQ\ufff2"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := LinkTokenLabels(tt.input); got != tt.want {
+				t.Fatalf("got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestHasEmailMarkupArtifacts(t *testing.T) {
 	for _, value := range []string{
 		"Notice\n<!--[if !mso]><!-->\nText", "<!--[IF false]><!-->",

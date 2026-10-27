@@ -84,6 +84,85 @@ func TestAlternativeBodySelection(t *testing.T) {
 	}
 }
 
+func TestSignatureOnlyAlternativeSelection(t *testing.T) {
+	const signature = "---\nExampleCloud Control Panel"
+	const notice = "Maintenance starts at 21:00."
+	fullHTML := "<p>" + notice + "</p><p>---<br>ExampleCloud Control Panel</p><p>Copyright ExampleCloud</p>"
+	for _, tt := range []struct {
+		name  string
+		plain string
+		html  string
+		want  string
+	}{
+		{"signature only", signature, fullHTML, notice + "\n\n" + signature + "\n\nCopyright ExampleCloud"},
+		{"linked footer", signature, "<p>" + notice + `</p><p>---<br><a href="https://example.invalid">ExampleCloud Control Panel</a></p>`, notice + "\n\n---\n" + formatting.EncodeLinkToken("ExampleCloud Control Panel", "https://example.invalid")},
+		{"padding and CRLF", " \u00a0\r\n\u200b\r\n---\r\nExampleCloud Control Panel\r\n", fullHTML, notice + "\n\n" + signature + "\n\nCopyright ExampleCloud"},
+		{"standard signature delimiter", "-- \nSupport Team", "<p>" + notice + "</p><p>-- <br>Support Team</p>", notice + "\n\n--\nSupport Team"},
+		{"indented signature", "  ---\n  ExampleCloud Control Panel", fullHTML, notice + "\n\n" + signature + "\n\nCopyright ExampleCloud"},
+		{"real body before signature", notice + "\n\n" + signature, fullHTML, notice + "\n\n" + signature},
+		{"short real body", "OK", fullHTML, "OK"},
+		{"longer HTML alone is not evidence", "Thanks", strings.Repeat("<p>More HTML</p>", 20), "Thanks"},
+		{"leading horizontal rule", "---\nImportant plain-text notice", fullHTML, "---\nImportant plain-text notice"},
+		{"inline delimiter", "--- ExampleCloud Control Panel", fullHTML, "--- ExampleCloud Control Panel"},
+		{"different footer", signature, "<p>" + notice + "</p><p>---<br>Other Team</p>", signature},
+		{"footer must match whole lines", signature, "<p>" + notice + "</p><p>---<br>ExampleCloud Control Panel Extra</p>", signature},
+		{"delimiter must match whole line", signature, "<p>" + notice + "---</p><p>ExampleCloud Control Panel</p>", signature},
+		{"equivalent HTML", signature, "<p>---<br>ExampleCloud Control Panel</p>", signature},
+		{"only trailing HTML", signature, "<p>---<br>ExampleCloud Control Panel</p><p>Copyright</p>", signature},
+		{"empty HTML", signature, "", signature},
+		{"hidden HTML", signature, "<style>body {color: red}</style><p hidden>" + notice + "</p>", signature},
+		{"invisible HTML", signature, "<pre>\u200b</pre>", signature},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, reverse := range []bool{false, true} {
+				for _, related := range []bool{false, true} {
+					plain := textPart("text/plain", tt.plain)
+					html := textPart("text/html", tt.html)
+					if related {
+						html = multipart("multipart/related", html, textPart("text/plain", "Not a body"))
+					}
+					payload := multipart("multipart/alternative", plain, html)
+					if reverse {
+						payload = multipart("multipart/alternative", html, plain)
+					}
+					got, _, err := ExtractBodyAndAttachments(payload)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if got != tt.want {
+						t.Fatalf("reverse=%v related=%v: got %q, want %q", reverse, related, got, tt.want)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestSignatureOnlyPlainFallback(t *testing.T) {
+	const signature = "---\nExampleCloud Control Panel"
+	for _, payload := range []map[string]any{
+		textPart("text/plain", signature),
+		multipart("multipart/alternative", textPart("text/plain", signature)),
+		multipart("multipart/alternative", textPart("text/plain", signature), map[string]any{"mimeType": "text/html", "body": map[string]any{"data": "!bad base64!"}}),
+	} {
+		got, _, err := ExtractBodyAndAttachments(payload)
+		if err != nil || got != signature {
+			t.Fatalf("got %q, %v; want original signature", got, err)
+		}
+	}
+}
+
+func TestMixedBodyWithSignatureIsNotSignatureOnly(t *testing.T) {
+	const signature = "---\nExampleCloud Control Panel"
+	payload := multipart("multipart/alternative",
+		multipart("multipart/mixed", textPart("text/plain", "Plain body"), textPart("text/plain", signature)),
+		textPart("text/html", "<p>HTML body</p><p>---<br>ExampleCloud Control Panel</p>"))
+	got, _, err := ExtractBodyAndAttachments(payload)
+	if err != nil || got != "Plain body\n\n"+signature {
+		t.Fatalf("got %q, %v; want complete mixed plain body", got, err)
+	}
+}
+
 func TestRelatedRootSelection(t *testing.T) {
 	for _, tt := range []struct{ name, contentType, want string }{
 		{"default first", "multipart/related", "Resource"},
@@ -259,6 +338,63 @@ func TestExtractBodyAndAttachmentsNestedMixedAllocations(t *testing.T) {
 	// but not repeated full-body copies as the selection travels up the tree.
 	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 12<<20 {
 		t.Fatalf("nested mixed message allocated %d bytes, want <= 12 MiB", allocated)
+	}
+}
+
+func TestEmptyBodyComparisonIsCached(t *testing.T) {
+	section := &bodySection{text: formatting.EncodeLinkToken(strings.Repeat(" ", 480<<10), "https://example.invalid")}
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	for i := 0; i < 128; i++ {
+		if got := section.comparisonText(); got != "" {
+			t.Fatalf("whitespace-only link has visible comparison text: %q", got)
+		}
+	}
+	runtime.ReadMemStats(&after)
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 8<<20 {
+		t.Fatalf("empty comparison allocated %d bytes, want <= 8 MiB", allocated)
+	}
+}
+
+func TestNestedAlternativeComparisonAllocations(t *testing.T) {
+	const signature = "---\nSupport Team"
+	longText := strings.Repeat("x", 480<<10)
+	for _, tt := range []struct {
+		name    string
+		base    map[string]any
+		sibling map[string]any
+	}{
+		{"ordinary plain", textPart("text/plain", longText), textPart("text/html", "<p>Other</p>")},
+		{"long signature", textPart("text/plain", "---\n"+longText), textPart("text/html", "<p>Other</p>")},
+		{"HTML with matching footer", textPart("text/html", "<p>"+longText+"</p><p>---<br>Support Team</p>"), textPart("text/plain", signature)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			payload := tt.base
+			for i := 0; i < 128; i++ {
+				if i%2 == 0 {
+					payload = multipart("multipart/alternative", payload, tt.sibling)
+				} else {
+					payload = multipart("multipart/alternative", tt.sibling, payload)
+				}
+			}
+			runtime.GC()
+			var before, after runtime.MemStats
+			runtime.ReadMemStats(&before)
+			body, _, err := ExtractBodyAndAttachments(payload)
+			runtime.ReadMemStats(&after)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(body, strings.Repeat("x", 100)) || !strings.HasSuffix(body, "… (message truncated)") {
+				t.Fatal("nested alternatives lost or failed to truncate the selected body")
+			}
+			// Retained comparison text must be cached, not reallocated at every
+			// ancestor (which consumed over 200 MiB for this message).
+			if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 24<<20 {
+				t.Fatalf("nested alternatives allocated %d bytes, want <= 24 MiB", allocated)
+			}
+		})
 	}
 }
 

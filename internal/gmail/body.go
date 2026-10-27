@@ -18,8 +18,18 @@ const (
 )
 
 type bodySection struct {
-	text string
-	next *bodySection
+	text            string
+	comparison      string // Cached visible text for alternative comparisons.
+	comparisonReady bool
+	next            *bodySection
+}
+
+func (section *bodySection) comparisonText() string {
+	if !section.comparisonReady {
+		section.comparison = formatting.NormalizeWhitespace(formatting.LinkTokenLabels(section.text))
+		section.comparisonReady = true
+	}
+	return section.comparison
 }
 
 // Candidates own their section lists. Mixed containers splice them in constant
@@ -74,8 +84,9 @@ func (body bodyCandidate) join() string {
 
 // ExtractBodyAndAttachments chooses one representation per multipart/alternative
 // group, retaining independent sections in multipart/mixed. Clean plain text is
-// preferred; HTML is used when the plain alternative leaks email markup. A noisy
-// plain alternative is still better than losing the message altogether.
+// preferred; HTML is used when the plain alternative leaks email markup or only
+// contains the HTML's signature. An incomplete plain alternative is still better
+// than losing the message altogether.
 func ExtractBodyAndAttachments(payload map[string]any) (string, []models.AttachmentMeta, error) {
 	var attachments []models.AttachmentMeta
 	var visit func(map[string]any, bool) (bodyCandidate, error)
@@ -131,7 +142,7 @@ func ExtractBodyAndAttachments(payload map[string]any) (string, []models.Attachm
 				switch mimeType {
 				case "multipart/alternative":
 					// Later equally suitable alternatives have higher sender fidelity.
-					if candidate.first != nil && (selected.first == nil || candidate.quality <= selected.quality) {
+					if preferAlternative(candidate, selected) {
 						selected = candidate
 					}
 				case "multipart/related":
@@ -161,6 +172,46 @@ func ExtractBodyAndAttachments(payload map[string]any) (string, []models.Attachm
 		bodyText = formatting.TruncateText(bodyText, maxBodyTextRunes) + "\n\u2026 (message truncated)"
 	}
 	return bodyText, attachments, nil
+}
+
+func preferAlternative(candidate, selected bodyCandidate) bool {
+	if candidate.first == nil {
+		return false
+	}
+	if selected.first == nil || signatureOnlyAlternative(selected, candidate) {
+		return true
+	}
+	return candidate.quality <= selected.quality && !signatureOnlyAlternative(candidate, selected)
+}
+
+// Some senders leave only a signature in text/plain. Require both an explicit
+// leading signature delimiter and the same footer after visible HTML content;
+// a short plain body or longer HTML alone is not evidence of missing prose.
+func signatureOnlyAlternative(plain, html bodyCandidate) bool {
+	if plain.quality != cleanPlainBody || html.quality != htmlBody || plain.first != plain.last {
+		return false
+	}
+	// Reject ordinary prose before allocating any comparison form.
+	delimiter, _, found := strings.Cut(plain.first.text, "\n")
+	delimiter = strings.TrimSpace(delimiter)
+	if !found || (delimiter != "--" && delimiter != "---") {
+		return false
+	}
+	signature := plain.first.comparisonText()
+	// Cache each section's visible text so nested alternatives do not repeatedly
+	// normalize full bodies. Keep the original text/link tokens for rendering.
+	precedingContent := false
+	for section := html.first; section != nil; section = section.next {
+		text := section.comparisonText()
+		start := strings.LastIndex(text, signature)
+		end := start + len(signature)
+		if start >= 0 && (start > 0 || precedingContent) &&
+			(start == 0 || text[start-1] == '\n') && (end == len(text) || text[end] == '\n') {
+			return true
+		}
+		precedingContent = precedingContent || text != ""
+	}
+	return false
 }
 
 func bodyAttachmentMeta(mimeType, filename string, body map[string]any) models.AttachmentMeta {
