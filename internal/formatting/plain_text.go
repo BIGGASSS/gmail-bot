@@ -15,6 +15,29 @@ func HasEmailMarkupArtifacts(value string) bool {
 
 var emailMarkupArtifacts = regexp.MustCompile(`(?i)<!(?:--\s*)?\[(?:if\b|endif\b)|</?(?:v|o|w):[a-z][a-z0-9]*\b|<!doctype\s+html\b|<html(?:\s|>)`)
 
+// LinkTokenLabels replaces internal link tokens with their visible labels for
+// text comparisons. Other text, including literal markup/entities, is unchanged.
+func LinkTokenLabels(value string) string {
+	matches := linkTokenPattern.FindAllStringSubmatchIndex(value, -1)
+	if len(matches) == 0 {
+		return value
+	}
+	var out strings.Builder
+	last := 0
+	for _, match := range matches {
+		out.WriteString(value[last:match[0]])
+		label, err := decodeLinkComponent(value[match[2]:match[3]])
+		if err != nil {
+			out.WriteString(value[match[0]:match[1]])
+		} else {
+			out.WriteString(label)
+		}
+		last = match[1]
+	}
+	out.WriteString(value[last:])
+	return out.String()
+}
+
 // NormalizePlainText removes empty padding and excessive blank lines without
 // reflowing prose or destroying indentation, lists, code, or literal markup.
 // Entities in text/plain are intentionally not HTML-decoded.
