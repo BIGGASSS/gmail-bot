@@ -90,18 +90,50 @@ func TestHTMLFormattingNeutralizedAfterConditionalFiltering(t *testing.T) {
 
 func TestNeutralizeHTMLFormattingTags(t *testing.T) {
 	for _, tt := range []struct{ input, want string }{
-		{"<b>Bold</b>", "<span>Bold</span>"},
-		{`<A HREF="https://x">Up</A >`, `</x-gmail-bot-a><x-gmail-bot-a HREF="https://x">Up</x-gmail-bot-a >`},
-		{"<strong\fclass=x/><code>c</code>", "<span\fclass=x/><span>c</span>"},
-		{"<<b", "<<span"},
+		{"<b>Bold</b>", "<span x-gmail-bot-b>Bold</span x-gmail-bot-b>"},
+		{`<A HREF="https://x">Up</A >`, `</x-gmail-bot-a><x-gmail-bot-A HREF="https://x">Up</x-gmail-bot-A >`},
+		{"<strong\fclass=x/><code>c</code>", "<span x-gmail-bot-strong\fclass=x/><span x-gmail-bot-code>c</span x-gmail-bot-code>"},
+		{"<<b", "<<span x-gmail-bot-b"},
 		{"</", "</"},
 		{"x < b", "x < b"},
 		// Longer non-formatting names must not be mistaken for formatting tags.
 		{"<body><base><span><image><stronger><bdi></bdi>", "<body><base><span><image><stronger><bdi></bdi>"},
 	} {
-		if got := neutralizeHTMLFormattingTags(tt.input); got != tt.want {
+		got := neutralizeHTMLFormattingTags(tt.input)
+		if got != tt.want {
 			t.Errorf("neutralize(%q) = %q, want %q", tt.input, got, tt.want)
 		}
+		if restored := restoreHTMLFormattingTags(got); restored != tt.input {
+			t.Errorf("restore(%q) = %q, want %q", got, restored, tt.input)
+		}
+	}
+	for _, input := range []string{"</a><a>", "<a></a><a", "</A><A href=x></a >", "<a<b</a</b"} {
+		if got := restoreHTMLFormattingTags(neutralizeHTMLFormattingTags(input)); got != input {
+			t.Errorf("round trip of %q = %q", input, got)
+		}
+	}
+}
+
+func TestHTMLFormattingRenameIsInvisible(t *testing.T) {
+	for _, tt := range []struct{ input, want string }{
+		{"<textarea><b>literal</b></textarea>", "<b>literal</b>"},
+		{`<xmp><a href="https://example.com">literal</a></xmp>`, `<a href="https://example.com">literal</a>`},
+		{"<plaintext><CODE>literal</code>", "<CODE>literal</code>"},
+		{"<textarea>&lt;b&gt; <i>x</I></textarea>", "<b> <i>x</I>"},
+		{`<a href="https://example.com/?q=<b>">Search</a>`, EncodeLinkToken("Search", "https://example.com/?q=<b>")},
+		{"<select><textarea><b>Bold</b></textarea></select>", "<b>Bold</b>"},
+		// Tags the parser does see are still neutralized and not shown. Like
+		// <b>, the renamed tag breaks out of foreign content.
+		{"<svg><style><b>Bold</b></style></svg>", "Bold"},
+		{"<math><mi><b>Bold</b></mi></math>", "Bold"},
+		{"<select><b>Bold</b></select>", "Bold"},
+		{"<noscript><b>Bold</b></noscript>", "Bold"},
+	} {
+		t.Run(tt.input, func(t *testing.T) {
+			if got := mustHTMLText(t, tt.input); got != tt.want {
+				t.Fatalf("got %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 

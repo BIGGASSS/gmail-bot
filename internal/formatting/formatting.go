@@ -317,7 +317,7 @@ func (w *htmlTextWriter) walk(n *nethtml.Node, pre bool) {
 	switch n.Type {
 	case nethtml.TextNode:
 		if !w.invisible {
-			w.text(n.Data, pre)
+			w.text(htmlTextNodeData(n), pre)
 		}
 		return
 	case nethtml.DocumentNode:
@@ -497,7 +497,7 @@ func (w *htmlTextWriter) flatten(n *nethtml.Node, pre bool) {
 		switch n.Type {
 		case nethtml.TextNode:
 			if !v.invisible {
-				w.text(n.Data, v.pre)
+				w.text(htmlTextNodeData(n), v.pre)
 			}
 			continue
 		case nethtml.ElementNode:
@@ -553,7 +553,7 @@ func (w *htmlTextWriter) flatten(n *nethtml.Node, pre bool) {
 func htmlAttribute(n *nethtml.Node, key string) (string, bool) {
 	for _, attr := range n.Attr {
 		if attr.Key == key {
-			return attr.Val, true
+			return restoreHTMLFormattingTags(attr.Val), true
 		}
 	}
 	return "", false
