@@ -86,7 +86,8 @@ func (body bodyCandidate) join() string {
 // group, retaining independent sections in multipart/mixed. Clean plain text is
 // preferred; HTML is used when the plain alternative leaks email markup or only
 // contains the HTML's signature. An incomplete plain alternative is still better
-// than losing the message altogether.
+// than losing the message altogether, so an alternative that cannot be converted
+// is skipped; the error is returned only if no alternative in the group is usable.
 func ExtractBodyAndAttachments(payload map[string]any) (string, []models.AttachmentMeta, error) {
 	var attachments []models.AttachmentMeta
 	var visit func(map[string]any, bool) (bodyCandidate, error)
@@ -131,13 +132,25 @@ func ExtractBodyAndAttachments(payload map[string]any) (string, []models.Attachm
 			if mimeType == "multipart/related" {
 				root = relatedRootIndex(part, children)
 			}
+			var alternativeErr error
 			for i, child := range children {
 				childPart, _ := child.(map[string]any)
 				// Visit even unselected alternatives/resources to retain metadata
 				// and propagate conversion errors.
+				retained := len(attachments)
 				candidate, err := visit(childPart, i == root)
 				if err != nil {
-					return bodyCandidate{}, fmt.Errorf("MIME part %d: %w", i, err)
+					err = fmt.Errorf("MIME part %d: %w", i, err)
+					if mimeType != "multipart/alternative" {
+						return bodyCandidate{}, err
+					}
+					// Another representation of the same content may still be
+					// usable. Drop partial metadata from the failed alternative.
+					attachments = attachments[:retained]
+					if alternativeErr == nil {
+						alternativeErr = err
+					}
+					continue
 				}
 				switch mimeType {
 				case "multipart/alternative":
@@ -154,6 +167,9 @@ func ExtractBodyAndAttachments(payload map[string]any) (string, []models.Attachm
 					// Mixed (and unrecognized) containers have independent sections.
 					selected.append(candidate)
 				}
+			}
+			if selected.first == nil && alternativeErr != nil {
+				return bodyCandidate{}, alternativeErr
 			}
 		}
 		if isAttachment && selected.first == nil {

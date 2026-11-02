@@ -164,9 +164,7 @@ func StripHTML(value string) (string, error) {
 }
 
 // HTMLToTelegramText converts email HTML to text with safe link tokens.
-// Sources over 2 MiB, 4096 '<' delimiters, or the conservative formatting-clone
-// budget return ErrHTMLResourceLimit. Formatting-tag preflight also caps each
-// candidate at 8 KiB and cumulative scanning at 128 KiB, including overlaps.
+// Sources over 2 MiB or 4096 '<' delimiters return ErrHTMLResourceLimit.
 // Parsing failures return an error, never a partial or fallback body.
 func HTMLToTelegramText(value string) (string, error) {
 	return extractHTMLText(value, true)
@@ -174,8 +172,8 @@ func HTMLToTelegramText(value string) (string, error) {
 
 func extractHTMLText(value string, preserveAnchorTextLinks bool) (string, error) {
 	// Bound source processing before tokenization. Count delimiters in comments,
-	// attributes and text too. These limits alone do not bound DOM allocation:
-	// HTML5 formatting reconstruction needs a separate amplification budget.
+	// attributes and text too. With formatting elements neutralized below, the
+	// DOM is linear in the source, so these limits also bound DOM allocation.
 	if len(value) > maxHTMLBytes || strings.Count(value, "<") > maxHTMLMarkup {
 		return "", ErrHTMLResourceLimit
 	}
@@ -186,9 +184,7 @@ func extractHTMLText(value string, preserveAnchorTextLinks bool) (string, error)
 	if err != nil {
 		return "", fmt.Errorf("filter email HTML conditionals: %w", err)
 	}
-	if err := checkHTMLCloneBudget(filtered); err != nil {
-		return "", err
-	}
+	filtered = neutralizeHTMLFormattingTags(filtered)
 	doc, err := nethtml.ParseWithOptions(strings.NewReader(filtered), nethtml.ParseOptionEnableScripting(false))
 	if err != nil {
 		return "", fmt.Errorf("parse email HTML: %w", err)
@@ -357,7 +353,7 @@ func (w *htmlTextWriter) walk(n *nethtml.Node, pre bool) {
 		w.boundary(2)
 		w.children(n, true)
 		w.boundary(2)
-	case "a":
+	case htmlAnchorTag:
 		// Foreign/malformed markup can retain nested anchors in the DOM. Never
 		// encode a token inside another token's label.
 		if w.inAnchor {
@@ -511,7 +507,7 @@ func (w *htmlTextWriter) flatten(n *nethtml.Node, pre bool) {
 			}
 			v.invisible = invisible
 			switch n.Data {
-			case "a":
+			case htmlAnchorTag:
 				if !w.inAnchor {
 					inherited := w.invisible
 					w.invisible = v.invisible
