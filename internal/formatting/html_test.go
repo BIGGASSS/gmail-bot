@@ -212,7 +212,9 @@ func TestHTMLMalformedMarkup(t *testing.T) {
 		{`<p>2 &lt; 3 &amp;&amp; 4 &gt; 1`, "2 < 3 && 4 > 1"},
 		{`<a href="https://example.com">Unclosed <strong>label`, EncodeLinkToken("Unclosed label", "https://example.com")},
 		{`<a href="https://one.example">One<a href="https://two.example">Two`, EncodeLinkToken("One", "https://one.example") + EncodeLinkToken("Two", "https://two.example")},
-		{`<svg><a href="https://one.example">One<a href="https://two.example">Two</a></a></svg>`, EncodeLinkToken("OneTwo", "https://one.example")},
+		{`<svg><a href="https://one.example">One<a href="https://two.example">Two</a></a></svg>`, EncodeLinkToken("One", "https://one.example") + EncodeLinkToken("Two", "https://two.example")},
+		{`<a href="https://one.example">One<button><a href="https://two.example">Two</a></button></a>`, EncodeLinkToken("OneTwo", "https://one.example")},
+		{`<p><a href="https://one.example">One</p><p>Two <a href="https://two.example">Three</a>`, EncodeLinkToken("One", "https://one.example") + "\n\nTwo " + EncodeLinkToken("Three", "https://two.example")},
 	} {
 		t.Run(tt.input, func(t *testing.T) {
 			if got := mustHTMLText(t, tt.input); got != tt.want {
