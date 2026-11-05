@@ -360,20 +360,86 @@ func (b *Bot) handleLogout(ctx context.Context, message *tgbotapi.Message) {
 	b.reply(message.Chat.ID, b.revokeAndDescribe(ctx, removed))
 }
 
+// logoutPickerPageSize keeps the picker well under Telegram's limit on inline
+// keyboard buttons, however many accounts a user connects.
+const logoutPickerPageSize = 20
+
 func (b *Bot) sendLogoutPicker(chatID, telegramUserID int64, accounts []models.GoogleAccount) {
-	rows := make([][]tgbotapi.InlineKeyboardButton, 0, len(accounts)+1)
-	for _, account := range accounts {
+	text, markup := buildLogoutPicker(telegramUserID, accounts, 0)
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ReplyMarkup = markup
+	if _, err := b.api.Send(msg); err != nil {
+		applog.Errorf("Failed to send logout picker: %v", err)
+	}
+}
+
+// buildLogoutPicker renders one page of account buttons, with Previous/Next
+// buttons when needed and "All accounts" on every page. page is clamped.
+func buildLogoutPicker(telegramUserID int64, accounts []models.GoogleAccount, page int) (string, tgbotapi.InlineKeyboardMarkup) {
+	pages := (len(accounts) + logoutPickerPageSize - 1) / logoutPickerPageSize
+	if page >= pages {
+		page = pages - 1
+	}
+	if page < 0 {
+		page = 0
+	}
+	start := page * logoutPickerPageSize
+	end := start + logoutPickerPageSize
+	if end > len(accounts) {
+		end = len(accounts)
+	}
+	rows := make([][]tgbotapi.InlineKeyboardButton, 0, end-start+2)
+	for _, account := range accounts[start:end] {
 		rows = append(rows, tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData(account.GmailEmail, BuildLogoutCallbackData(telegramUserID, account.ID)),
 		))
 	}
+	var nav []tgbotapi.InlineKeyboardButton
+	if page > 0 {
+		nav = append(nav, tgbotapi.NewInlineKeyboardButtonData("« Previous", BuildLogoutPageCallbackData(telegramUserID, page-1)))
+	}
+	if page < pages-1 {
+		nav = append(nav, tgbotapi.NewInlineKeyboardButtonData("Next »", BuildLogoutPageCallbackData(telegramUserID, page+1)))
+	}
+	if len(nav) > 0 {
+		rows = append(rows, nav)
+	}
 	rows = append(rows, tgbotapi.NewInlineKeyboardRow(
 		tgbotapi.NewInlineKeyboardButtonData("All accounts", BuildLogoutCallbackData(telegramUserID, LogoutAllAccounts)),
 	))
-	msg := tgbotapi.NewMessage(chatID, "Which Gmail account do you want to disconnect?")
-	msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(rows...)
-	if _, err := b.api.Send(msg); err != nil {
-		applog.Errorf("Failed to send logout picker: %v", err)
+	text := "Which Gmail account do you want to disconnect?"
+	if pages > 1 {
+		text += fmt.Sprintf("\nPage %d of %d", page+1, pages)
+	}
+	return text, tgbotapi.NewInlineKeyboardMarkup(rows...)
+}
+
+func (b *Bot) handleLogoutPageCallback(ctx context.Context, callback *tgbotapi.CallbackQuery) {
+	owner, page, ok := ParseLogoutPageCallbackData(callback.Data)
+	if !ok || owner != callback.From.ID {
+		b.answerCallback(callback.ID, "This button belongs to someone else.", true)
+		return
+	}
+	if callback.Message == nil {
+		b.answerCallback(callback.ID, "Could not edit this message.", true)
+		return
+	}
+	accounts, err := b.database.ListGoogleAccountsForUser(ctx, owner)
+	if err != nil {
+		applog.Errorf("Failed to load accounts for logout picker: %v", err)
+		b.answerCallback(callback.ID, "Failed to load your accounts.", true)
+		return
+	}
+	b.answerCallback(callback.ID, "", false)
+	var edit tgbotapi.EditMessageTextConfig
+	if len(accounts) == 0 {
+		edit = tgbotapi.NewEditMessageText(callback.Message.Chat.ID, callback.Message.MessageID, "No Gmail account is currently connected.")
+	} else {
+		text, markup := buildLogoutPicker(owner, accounts, page)
+		edit = tgbotapi.NewEditMessageTextAndMarkup(callback.Message.Chat.ID, callback.Message.MessageID, text, markup)
+	}
+	if _, err := b.api.Send(edit); err != nil {
+		applog.Errorf("Failed to update logout picker page: %v", err)
 	}
 }
 
@@ -449,6 +515,10 @@ func (b *Bot) revokeAndDescribe(ctx context.Context, removed []models.GoogleAcco
 }
 
 func (b *Bot) handleCallback(ctx context.Context, callback *tgbotapi.CallbackQuery) {
+	if strings.HasPrefix(callback.Data, LogoutPagePrefix) {
+		b.handleLogoutPageCallback(ctx, callback)
+		return
+	}
 	if strings.HasPrefix(callback.Data, LogoutPrefix) {
 		b.handleLogoutCallback(ctx, callback)
 		return

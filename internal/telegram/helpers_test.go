@@ -93,3 +93,18 @@ func TestSplitMessageText(t *testing.T) {
 		}
 	}
 }
+
+func TestLogoutPageCallbackDataRoundTrip(t *testing.T) {
+	user, page, ok := ParseLogoutPageCallbackData(BuildLogoutPageCallbackData(123456789, 4))
+	if !ok || user != 123456789 || page != 4 {
+		t.Fatalf("user=%d page=%d ok=%v", user, page, ok)
+	}
+	for _, bad := range []string{"logoutpage:", "logoutpage:1", "logoutpage:x:1", "logoutpage:1:-1", "logout:1:2"} {
+		if _, _, ok := ParseLogoutPageCallbackData(bad); ok {
+			t.Fatalf("parsed malformed data %q", bad)
+		}
+	}
+	if _, _, ok := ParseLogoutCallbackData(BuildLogoutPageCallbackData(1, 2)); ok {
+		t.Fatal("page data parsed as a logout button")
+	}
+}

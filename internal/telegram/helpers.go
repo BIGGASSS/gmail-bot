@@ -24,6 +24,33 @@ func BuildLogoutCallbackData(telegramUserID, accountID int64) string {
 	return LogoutPrefix + strconv.FormatInt(telegramUserID, 10) + ":" + target
 }
 
+// LogoutPagePrefix starts callback data that shows another page of the logout
+// picker: logoutpage:<telegram user ID>:<zero-based page>.
+const LogoutPagePrefix = "logoutpage:"
+
+func BuildLogoutPageCallbackData(telegramUserID int64, page int) string {
+	return LogoutPagePrefix + strconv.FormatInt(telegramUserID, 10) + ":" + strconv.Itoa(page)
+}
+
+func ParseLogoutPageCallbackData(callbackData string) (int64, int, bool) {
+	if !strings.HasPrefix(callbackData, LogoutPagePrefix) {
+		return 0, 0, false
+	}
+	owner, rawPage, found := strings.Cut(strings.TrimPrefix(callbackData, LogoutPagePrefix), ":")
+	if !found {
+		return 0, 0, false
+	}
+	user, err := strconv.ParseInt(owner, 10, 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	page, err := strconv.Atoi(rawPage)
+	if err != nil || page < 0 {
+		return 0, 0, false
+	}
+	return user, page, true
+}
+
 // ParseLogoutCallbackData returns the owning user and the account ID, which is
 // LogoutAllAccounts for the "All accounts" button.
 func ParseLogoutCallbackData(callbackData string) (int64, int64, bool) {

@@ -314,3 +314,79 @@ func TestLongAccountListsStayWithinTelegramLimit(t *testing.T) {
 		}
 	}
 }
+
+func keyboardOf(t *testing.T, markup any) [][]tgbotapi.InlineKeyboardButton {
+	t.Helper()
+	switch m := markup.(type) {
+	case tgbotapi.InlineKeyboardMarkup:
+		return m.InlineKeyboard
+	case *tgbotapi.InlineKeyboardMarkup:
+		if m != nil {
+			return m.InlineKeyboard
+		}
+	}
+	t.Fatalf("no inline keyboard: %#v", markup)
+	return nil
+}
+
+func TestLogoutPickerPagesManyAccounts(t *testing.T) {
+	ctx := context.Background()
+	db := openTelegramTestDB(t)
+	emails := make([]string, 150)
+	for i := range emails {
+		emails[i] = fmt.Sprintf("account%03d@example.com", i)
+	}
+	accounts := seedAccounts(t, db, 1, emails...)
+	settings := testSettings()
+	settings.AuthorizedTelegramUserIDs = map[int64]struct{}{1: {}, 2: {}}
+	api := &fakeUpdateClient{maxText: TelegramTextLimit, maxButtons: 100}
+	revoker := &fakeRevoker{}
+	bot := NewBot(settings, api, db, revoker, nil, NewNotifier(api))
+
+	bot.HandleUpdate(ctx, commandUpdate(1, 1, "/logout"))
+	if api.rejected != 0 || len(api.messages) != 1 {
+		t.Fatalf("picker rejected=%d messages=%d", api.rejected, len(api.messages))
+	}
+	first := keyboardOf(t, api.messages[0].markup)
+	if !strings.Contains(api.messages[0].text, "Page 1 of 8") || len(first) != logoutPickerPageSize+2 {
+		t.Fatalf("first page text=%q rows=%d", api.messages[0].text, len(first))
+	}
+	nav := first[logoutPickerPageSize]
+	if len(nav) != 1 || nav[0].Text != "Next »" || first[len(first)-1][0].Text != "All accounts" {
+		t.Fatalf("first page nav=%+v", first[logoutPickerPageSize:])
+	}
+
+	// Someone else cannot page through the picker.
+	bot.HandleUpdate(ctx, callbackUpdate(2, 1, 1, *nav[0].CallbackData))
+	if len(api.messages) != 1 {
+		t.Fatalf("other user paged the picker: %+v", api.messages)
+	}
+
+	bot.HandleUpdate(ctx, callbackUpdate(1, 1, 1, *nav[0].CallbackData))
+	if len(api.messages) != 2 || !api.messages[1].edit || !strings.Contains(api.messages[1].text, "Page 2 of 8") {
+		t.Fatalf("page 2: %+v", api.messages)
+	}
+	second := keyboardOf(t, api.messages[1].markup)
+	if second[0][0].Text != emails[logoutPickerPageSize] || len(second[logoutPickerPageSize]) != 2 {
+		t.Fatalf("page 2 rows: first=%q nav=%+v", second[0][0].Text, second[logoutPickerPageSize])
+	}
+
+	// The last page holds the remainder, and an out-of-range page is clamped to it.
+	bot.HandleUpdate(ctx, callbackUpdate(1, 1, 1, BuildLogoutPageCallbackData(1, 99)))
+	last := keyboardOf(t, api.messages[2].markup)
+	if !strings.Contains(api.messages[2].text, "Page 8 of 8") || last[0][0].Text != emails[140] || len(last) != 10+2 {
+		t.Fatalf("last page text=%q rows=%d", api.messages[2].text, len(last))
+	}
+
+	// A button on a later page disconnects that account.
+	bot.HandleUpdate(ctx, callbackUpdate(1, 1, 1, *last[0][0].CallbackData))
+	if len(revoker.revoked) != 1 || revoker.revoked[0] != "refresh-"+emails[140] {
+		t.Fatalf("revoked=%v", revoker.revoked)
+	}
+	if gone, _ := db.GetGoogleAccountByID(ctx, accounts[140].ID); gone != nil {
+		t.Fatal("account from last page not removed")
+	}
+	if api.rejected != 0 {
+		t.Fatalf("Telegram would reject %d messages", api.rejected)
+	}
+}

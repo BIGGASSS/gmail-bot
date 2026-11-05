@@ -27,6 +27,25 @@ type fakeUpdateClient struct {
 	// maxText, when set, rejects longer texts the way Telegram does.
 	maxText  int
 	rejected int
+	// maxButtons, when set, rejects inline keyboards with more buttons.
+	maxButtons int
+}
+
+func countButtons(markup any) int {
+	var keyboard [][]tgbotapi.InlineKeyboardButton
+	switch m := markup.(type) {
+	case tgbotapi.InlineKeyboardMarkup:
+		keyboard = m.InlineKeyboard
+	case *tgbotapi.InlineKeyboardMarkup:
+		if m != nil {
+			keyboard = m.InlineKeyboard
+		}
+	}
+	n := 0
+	for _, row := range keyboard {
+		n += len(row)
+	}
+	return n
 }
 
 type sentMessage struct {
@@ -40,14 +59,17 @@ type sentMessage struct {
 func (f *fakeUpdateClient) Send(c tgbotapi.Chattable) (tgbotapi.Message, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	var text string
+	var (
+		text   string
+		markup any
+	)
 	switch msg := c.(type) {
 	case tgbotapi.MessageConfig:
-		text = msg.Text
+		text, markup = msg.Text, msg.ReplyMarkup
 	case tgbotapi.EditMessageTextConfig:
-		text = msg.Text
+		text, markup = msg.Text, msg.ReplyMarkup
 	}
-	if f.maxText > 0 && len(utf16.Encode([]rune(text))) > f.maxText {
+	if (f.maxText > 0 && len(utf16.Encode([]rune(text))) > f.maxText) || (f.maxButtons > 0 && countButtons(markup) > f.maxButtons) {
 		f.rejected++
 		return tgbotapi.Message{}, fmt.Errorf("Bad Request: message is too long")
 	}
