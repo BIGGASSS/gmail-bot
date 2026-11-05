@@ -11,6 +11,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf16"
 
 	"github.com/BIGGASSS/gmail-bot/internal/config"
 	"github.com/BIGGASSS/gmail-bot/internal/database"
@@ -23,23 +24,62 @@ type fakeUpdateClient struct {
 	mu       sync.Mutex
 	messages []sentMessage
 	requests []tgbotapi.Chattable
+	// maxText, when set, rejects longer texts the way Telegram does.
+	maxText  int
+	rejected int
+	// maxButtons, when set, rejects inline keyboards with more buttons.
+	maxButtons int
+}
+
+func countButtons(markup any) int {
+	var keyboard [][]tgbotapi.InlineKeyboardButton
+	switch m := markup.(type) {
+	case tgbotapi.InlineKeyboardMarkup:
+		keyboard = m.InlineKeyboard
+	case *tgbotapi.InlineKeyboardMarkup:
+		if m != nil {
+			keyboard = m.InlineKeyboard
+		}
+	}
+	n := 0
+	for _, row := range keyboard {
+		n += len(row)
+	}
+	return n
 }
 
 type sentMessage struct {
 	chatID    int64
 	text      string
 	parseMode string
+	markup    any
+	edit      bool
 }
 
 func (f *fakeUpdateClient) Send(c tgbotapi.Chattable) (tgbotapi.Message, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	var (
+		text   string
+		markup any
+	)
+	switch msg := c.(type) {
+	case tgbotapi.MessageConfig:
+		text, markup = msg.Text, msg.ReplyMarkup
+	case tgbotapi.EditMessageTextConfig:
+		text, markup = msg.Text, msg.ReplyMarkup
+	}
+	if (f.maxText > 0 && len(utf16.Encode([]rune(text))) > f.maxText) || (f.maxButtons > 0 && countButtons(markup) > f.maxButtons) {
+		f.rejected++
+		return tgbotapi.Message{}, fmt.Errorf("Bad Request: message is too long")
+	}
 	switch msg := c.(type) {
 	case tgbotapi.MessageConfig:
 		f.messages = append(f.messages, sentMessage{
 			chatID:    msg.ChatID,
 			text:      msg.Text,
 			parseMode: msg.ParseMode,
+			markup:    msg.ReplyMarkup,
 		})
 		return tgbotapi.Message{MessageID: len(f.messages), Chat: &tgbotapi.Chat{ID: msg.ChatID}}, nil
 	case tgbotapi.EditMessageTextConfig:
@@ -47,6 +87,8 @@ func (f *fakeUpdateClient) Send(c tgbotapi.Chattable) (tgbotapi.Message, error) 
 			chatID:    msg.ChatID,
 			text:      msg.Text,
 			parseMode: msg.ParseMode,
+			markup:    msg.ReplyMarkup,
+			edit:      true,
 		})
 		return tgbotapi.Message{MessageID: msg.MessageID, Chat: &tgbotapi.Chat{ID: msg.ChatID}}, nil
 	default:
@@ -131,7 +173,7 @@ func TestStatusCommandThroughHandleUpdate(t *testing.T) {
 	ctx := context.Background()
 	db := openTelegramTestDB(t)
 	now := database.UTCNow()
-	if err := db.UpsertGoogleAccount(ctx, database.UpsertGoogleAccountParams{
+	if _, err := db.UpsertGoogleAccount(ctx, database.UpsertGoogleAccountParams{
 		TelegramUserID:         1,
 		GmailEmail:             "user@example.com",
 		AccessToken:            "access",
@@ -169,7 +211,7 @@ func TestLogoutCommandRevokesTokenAndDeletesAccount(t *testing.T) {
 	ctx := context.Background()
 	db := openTelegramTestDB(t)
 	now := database.UTCNow()
-	if err := db.UpsertGoogleAccount(ctx, database.UpsertGoogleAccountParams{
+	if _, err := db.UpsertGoogleAccount(ctx, database.UpsertGoogleAccountParams{
 		TelegramUserID:         1,
 		GmailEmail:             "user@example.com",
 		AccessToken:            "access",
@@ -192,7 +234,7 @@ func TestLogoutCommandRevokesTokenAndDeletesAccount(t *testing.T) {
 	if len(revoker.revoked) != 1 || revoker.revoked[0] != "refresh-token" {
 		t.Fatalf("revoked=%v", revoker.revoked)
 	}
-	account, err := db.GetGoogleAccount(ctx, 1)
+	account, err := userAccount(ctx, db, 1)
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
@@ -209,7 +251,7 @@ func TestLogoutStillDisconnectsWhenRevokeFails(t *testing.T) {
 	ctx := context.Background()
 	db := openTelegramTestDB(t)
 	now := database.UTCNow()
-	if err := db.UpsertGoogleAccount(ctx, database.UpsertGoogleAccountParams{
+	if _, err := db.UpsertGoogleAccount(ctx, database.UpsertGoogleAccountParams{
 		TelegramUserID:         1,
 		GmailEmail:             "user@example.com",
 		AccessToken:            "access",
@@ -227,7 +269,7 @@ func TestLogoutStillDisconnectsWhenRevokeFails(t *testing.T) {
 	bot := newTestBot(t, api, &fakeRevoker{fail: true}, db)
 	bot.HandleUpdate(ctx, commandUpdate(1, 1, "/logout"))
 
-	account, err := db.GetGoogleAccount(ctx, 1)
+	account, err := userAccount(ctx, db, 1)
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
@@ -267,7 +309,7 @@ func TestLogoutThroughRealOAuthRevokeHTTP(t *testing.T) {
 	ctx := context.Background()
 	db := openTelegramTestDB(t)
 	now := database.UTCNow()
-	if err := db.UpsertGoogleAccount(ctx, database.UpsertGoogleAccountParams{
+	if _, err := db.UpsertGoogleAccount(ctx, database.UpsertGoogleAccountParams{
 		TelegramUserID:         1,
 		GmailEmail:             "user@example.com",
 		AccessToken:            "access",
@@ -309,7 +351,7 @@ func TestLogoutThroughRealOAuthRevokeHTTP(t *testing.T) {
 	if revokedToken != "refresh-token" {
 		t.Fatalf("revokedToken=%q", revokedToken)
 	}
-	account, err := db.GetGoogleAccount(ctx, 1)
+	account, err := userAccount(ctx, db, 1)
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
@@ -385,7 +427,7 @@ func TestLogoutClearsStatesOnRevokeFailure(t *testing.T) {
 	ctx := context.Background()
 	db := openTelegramTestDB(t)
 	now := database.UTCNow()
-	if err := db.UpsertGoogleAccount(ctx, database.UpsertGoogleAccountParams{
+	if _, err := db.UpsertGoogleAccount(ctx, database.UpsertGoogleAccountParams{
 		TelegramUserID:         1,
 		GmailEmail:             "user@example.com",
 		AccessToken:            "access",
@@ -406,7 +448,7 @@ func TestLogoutClearsStatesOnRevokeFailure(t *testing.T) {
 	bot := newTestBot(t, api, &fakeRevoker{fail: true}, db)
 	bot.HandleUpdate(ctx, commandUpdate(1, 1, "/logout"))
 
-	account, err := db.GetGoogleAccount(ctx, 1)
+	account, err := userAccount(ctx, db, 1)
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}

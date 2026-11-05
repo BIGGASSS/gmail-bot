@@ -15,12 +15,13 @@ type PollerSettings interface {
 	PollInterval() time.Duration
 }
 
+// PollerDatabase is keyed by account ID; notifications go to the account's Telegram user.
 type PollerDatabase interface {
 	ListGoogleAccounts(ctx context.Context) ([]models.GoogleAccount, error)
-	UpdateLastHistoryID(ctx context.Context, telegramUserID int64, lastHistoryID string) error
-	MarkMessageDelivered(ctx context.Context, telegramUserID int64, gmailMessageID string, telegramChatID int64, telegramMessageID int) error
-	MarkReloginPromptSent(ctx context.Context, telegramUserID int64, sentAt *time.Time) error
-	DeleteGoogleAccount(ctx context.Context, telegramUserID int64) error
+	UpdateLastHistoryID(ctx context.Context, accountID int64, lastHistoryID string) error
+	MarkMessageDelivered(ctx context.Context, accountID int64, gmailMessageID string, telegramChatID int64, telegramMessageID int) error
+	MarkReloginPromptSent(ctx context.Context, accountID int64, sentAt *time.Time) error
+	DeleteGoogleAccount(ctx context.Context, accountID int64) error
 }
 
 type PollerGmail interface {
@@ -77,17 +78,17 @@ func (p *GmailPoller) Run(ctx context.Context) error {
 							p.handleInvalidGrant(ctx, account, oauthErr)
 							continue
 						}
-						applog.Errorf("Failed while polling Gmail for Telegram user %d: %v", account.TelegramUserID, err)
+						applog.Errorf("Failed while polling Gmail account %d for Telegram user %d: %v", account.ID, account.TelegramUserID, err)
 						continue
 					}
 					var gmailErr *gmail.APIError
 					var histErr *gmail.HistoryExpiredError
 					var apiErr *APIError
 					if errors.As(err, &gmailErr) || errors.As(err, &histErr) || errors.As(err, &apiErr) {
-						applog.Errorf("Failed while polling Gmail for Telegram user %d: %v", account.TelegramUserID, err)
+						applog.Errorf("Failed while polling Gmail account %d for Telegram user %d: %v", account.ID, account.TelegramUserID, err)
 						continue
 					}
-					applog.Errorf("Failed while polling Gmail for Telegram user %d: %v", account.TelegramUserID, err)
+					applog.Errorf("Failed while polling Gmail account %d for Telegram user %d: %v", account.ID, account.TelegramUserID, err)
 				}
 			}
 		}
@@ -111,10 +112,10 @@ func (p *GmailPoller) processAccount(ctx context.Context, account models.GoogleA
 	if err != nil {
 		var histErr *gmail.HistoryExpiredError
 		if errors.As(err, &histErr) {
-			if updateErr := p.database.UpdateLastHistoryID(ctx, account.TelegramUserID, histErr.CurrentHistoryID); updateErr != nil {
+			if updateErr := p.database.UpdateLastHistoryID(ctx, account.ID, histErr.CurrentHistoryID); updateErr != nil {
 				return updateErr
 			}
-			applog.Infof("Reset Gmail history cursor for user %d to %s.", account.TelegramUserID, histErr.CurrentHistoryID)
+			applog.Infof("Reset Gmail history cursor for account %d (Telegram user %d) to %s.", account.ID, account.TelegramUserID, histErr.CurrentHistoryID)
 			return nil
 		}
 		return err
@@ -125,7 +126,7 @@ func (p *GmailPoller) processAccount(ctx context.Context, account models.GoogleA
 		if err != nil {
 			return err
 		}
-		if err := p.database.MarkMessageDelivered(ctx, account.TelegramUserID, mail.GmailMessageID, sent.ChatID, sent.MessageID); err != nil {
+		if err := p.database.MarkMessageDelivered(ctx, account.ID, mail.GmailMessageID, sent.ChatID, sent.MessageID); err != nil {
 			return err
 		}
 	}
@@ -133,7 +134,7 @@ func (p *GmailPoller) processAccount(ctx context.Context, account models.GoogleA
 	// Advance the history cursor only after every message in the batch was
 	// delivered, so a failed send or delivery mark does not skip mail.
 	if latestHistoryID != account.LastHistoryID {
-		if err := p.database.UpdateLastHistoryID(ctx, account.TelegramUserID, latestHistoryID); err != nil {
+		if err := p.database.UpdateLastHistoryID(ctx, account.ID, latestHistoryID); err != nil {
 			return err
 		}
 	}
@@ -158,7 +159,7 @@ func (p *GmailPoller) SendManualReloginPromptIfDue(ctx context.Context, account 
 		applog.Errorf("Failed to send manual Gmail reconnect prompt to Telegram user %d: %v", account.TelegramUserID, err)
 		return nil
 	}
-	return p.database.MarkReloginPromptSent(ctx, account.TelegramUserID, nil)
+	return p.database.MarkReloginPromptSent(ctx, account.ID, nil)
 }
 
 func (p *GmailPoller) HandleInvalidGrant(ctx context.Context, account models.GoogleAccount, exc error) {
@@ -195,10 +196,10 @@ func (p *GmailPoller) handleInvalidGrant(ctx context.Context, account models.Goo
 		}
 	}
 	if !guardedDelete {
-		if err := p.database.DeleteGoogleAccount(ctx, account.TelegramUserID); err != nil {
-			applog.Errorf("Failed to disconnect Gmail account for Telegram user %d: %v", account.TelegramUserID, err)
+		if err := p.database.DeleteGoogleAccount(ctx, account.ID); err != nil {
+			applog.Errorf("Failed to disconnect Gmail account %d for Telegram user %d: %v", account.ID, account.TelegramUserID, err)
 			return
 		}
 	}
-	applog.Infof("Disconnected Gmail account for Telegram user %d after invalid_grant.", account.TelegramUserID)
+	applog.Infof("Disconnected Gmail account %d for Telegram user %d after invalid_grant.", account.ID, account.TelegramUserID)
 }

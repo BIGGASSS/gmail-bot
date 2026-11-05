@@ -158,12 +158,10 @@ func (s *Server) handleGoogleCallback(w http.ResponseWriter, r *http.Request) {
 	writeHTML(w, http.StatusOK, "<html><body><h1>Gmail connected.</h1><p>You can return to Telegram.</p></body></html>")
 }
 
+// completeLogin adds the Google account the user chose. An address the user has
+// already connected is rejected and its stored credentials are left untouched.
 func (s *Server) completeLogin(ctx context.Context, state models.OAuthState, code string) error {
 	telegramUserID, stateCreatedAt := state.TelegramUserID, state.CreatedAt
-	existingAccount, err := s.database.GetGoogleAccount(ctx, telegramUserID)
-	if err != nil {
-		return err
-	}
 	reloginPreferences, err := s.database.GetReloginPromptPreferences(ctx, telegramUserID)
 	if err != nil {
 		return err
@@ -173,39 +171,33 @@ func (s *Server) completeLogin(ctx context.Context, state models.OAuthState, cod
 	if err != nil {
 		return err
 	}
-
-	refreshToken := ""
-	reusedRefresh := tokenResponse.RefreshToken == nil || strings.TrimSpace(*tokenResponse.RefreshToken) == ""
-	if tokenResponse.RefreshToken != nil && strings.TrimSpace(*tokenResponse.RefreshToken) != "" {
-		refreshToken = *tokenResponse.RefreshToken
-	} else if existingAccount != nil {
-		refreshToken = existingAccount.RefreshToken
-	}
-	if strings.TrimSpace(refreshToken) == "" {
-		return &oauth.OAuthError{Message: "Google did not return a refresh token."}
+	if tokenResponse.RefreshToken == nil || strings.TrimSpace(*tokenResponse.RefreshToken) == "" {
+		return &oauth.OAuthError{Message: "Google did not return a refresh token. Please retry /login."}
 	}
 
 	profile, err := s.gmail.GetProfileForAccessToken(ctx, tokenResponse.AccessToken)
 	if err != nil {
 		return err
 	}
-	if reusedRefresh && existingAccount != nil && !strings.EqualFold(strings.TrimSpace(existingAccount.GmailEmail), strings.TrimSpace(profile.EmailAddress)) {
-		return &oauth.OAuthError{Message: "Google did not return a refresh token for this account. Retry /login with consent."}
-	}
 
 	connectedAt := database.UTCNow()
-	if err := s.database.CompleteOAuth(ctx, state, database.UpsertGoogleAccountParams{
+	err = s.database.CompleteOAuth(ctx, state, database.UpsertGoogleAccountParams{
 		TelegramUserID:         telegramUserID,
 		GmailEmail:             profile.EmailAddress,
 		AccessToken:            tokenResponse.AccessToken,
-		RefreshToken:           refreshToken,
+		RefreshToken:           *tokenResponse.RefreshToken,
 		TokenExpiry:            tokenResponse.ExpiresAt,
 		LastHistoryID:          profile.HistoryID,
 		ConnectedAt:            connectedAt,
 		ReloginPromptEnabled:   reloginPreferences.ReloginPromptEnabled,
 		ReloginPromptDelayDays: reloginPreferences.ReloginPromptDelayDays,
 		ReloginPromptBaseAt:    &stateCreatedAt,
-	}); err != nil {
+	})
+	if errors.Is(err, database.ErrAccountAlreadyConnected) {
+		// Do not revoke the new token: Google revocation would also end the existing connection.
+		return fmt.Errorf("%s is already connected. To reconnect it, send /logout and choose that account, then /login", profile.EmailAddress)
+	}
+	if err != nil {
 		return err
 	}
 

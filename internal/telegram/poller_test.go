@@ -11,23 +11,23 @@ import (
 )
 
 type dummyDatabase struct {
-	calls                    []string
-	deletedUserIDs           []int64
-	reloginPromptSentUserIDs []int64
-	updatedHistoryID         string
-	markDeliveredCalls       int
-	failMarkDeliveredOnCall  int
+	calls                       []string
+	deletedAccountIDs           []int64
+	reloginPromptSentAccountIDs []int64
+	updatedHistoryID            string
+	markDeliveredCalls          int
+	failMarkDeliveredOnCall     int
 }
 
 func (d *dummyDatabase) ListGoogleAccounts(ctx context.Context) ([]models.GoogleAccount, error) {
 	return nil, nil
 }
-func (d *dummyDatabase) UpdateLastHistoryID(ctx context.Context, telegramUserID int64, lastHistoryID string) error {
+func (d *dummyDatabase) UpdateLastHistoryID(ctx context.Context, accountID int64, lastHistoryID string) error {
 	d.calls = append(d.calls, "UpdateLastHistoryID")
 	d.updatedHistoryID = lastHistoryID
 	return nil
 }
-func (d *dummyDatabase) MarkMessageDelivered(ctx context.Context, telegramUserID int64, gmailMessageID string, telegramChatID int64, telegramMessageID int) error {
+func (d *dummyDatabase) MarkMessageDelivered(ctx context.Context, accountID int64, gmailMessageID string, telegramChatID int64, telegramMessageID int) error {
 	d.calls = append(d.calls, "MarkMessageDelivered")
 	d.markDeliveredCalls++
 	if d.failMarkDeliveredOnCall != 0 && d.markDeliveredCalls == d.failMarkDeliveredOnCall {
@@ -35,14 +35,14 @@ func (d *dummyDatabase) MarkMessageDelivered(ctx context.Context, telegramUserID
 	}
 	return nil
 }
-func (d *dummyDatabase) MarkReloginPromptSent(ctx context.Context, telegramUserID int64, sentAt *time.Time) error {
+func (d *dummyDatabase) MarkReloginPromptSent(ctx context.Context, accountID int64, sentAt *time.Time) error {
 	d.calls = append(d.calls, "MarkReloginPromptSent")
-	d.reloginPromptSentUserIDs = append(d.reloginPromptSentUserIDs, telegramUserID)
+	d.reloginPromptSentAccountIDs = append(d.reloginPromptSentAccountIDs, accountID)
 	return nil
 }
-func (d *dummyDatabase) DeleteGoogleAccount(ctx context.Context, telegramUserID int64) error {
+func (d *dummyDatabase) DeleteGoogleAccount(ctx context.Context, accountID int64) error {
 	d.calls = append(d.calls, "DeleteGoogleAccount")
-	d.deletedUserIDs = append(d.deletedUserIDs, telegramUserID)
+	d.deletedAccountIDs = append(d.deletedAccountIDs, accountID)
 	return nil
 }
 
@@ -108,6 +108,7 @@ func TestManualReloginPromptSendsOnceWhenDue(t *testing.T) {
 	connectedAt := time.Now().UTC().Add(-models.ManualReloginPromptDelay)
 	dueAt := connectedAt.Add(models.ManualReloginPromptDelay)
 	account := models.GoogleAccount{
+		ID:                     77,
 		TelegramUserID:         123,
 		GmailEmail:             "user@example.com",
 		AccessToken:            "access-token",
@@ -130,8 +131,8 @@ func TestManualReloginPromptSendsOnceWhenDue(t *testing.T) {
 	if prompt.chatID != 123 || prompt.gmailEmail != "user@example.com" || prompt.delayDays != 6 {
 		t.Fatalf("unexpected prompt: %+v", prompt)
 	}
-	if len(database.reloginPromptSentUserIDs) != 1 || database.reloginPromptSentUserIDs[0] != 123 {
-		t.Fatalf("expected sent mark: %+v", database.reloginPromptSentUserIDs)
+	if len(database.reloginPromptSentAccountIDs) != 1 || database.reloginPromptSentAccountIDs[0] != 77 {
+		t.Fatalf("expected sent mark: %+v", database.reloginPromptSentAccountIDs)
 	}
 }
 
@@ -142,6 +143,7 @@ func TestManualReloginPromptSkipsWhenDisabled(t *testing.T) {
 	connectedAt := time.Now().UTC().Add(-models.ManualReloginPromptDelay)
 	dueAt := connectedAt.Add(models.ManualReloginPromptDelay)
 	account := models.GoogleAccount{
+		ID:                     77,
 		TelegramUserID:         123,
 		GmailEmail:             "user@example.com",
 		AccessToken:            "access-token",
@@ -160,7 +162,7 @@ func TestManualReloginPromptSkipsWhenDisabled(t *testing.T) {
 	if len(notifier.manualReloginPrompts) != 0 {
 		t.Fatalf("expected no prompts, got %d", len(notifier.manualReloginPrompts))
 	}
-	if len(database.reloginPromptSentUserIDs) != 0 {
+	if len(database.reloginPromptSentAccountIDs) != 0 {
 		t.Fatalf("expected no sent marks")
 	}
 }
@@ -172,6 +174,7 @@ func TestManualReloginPromptSkipsWhenNotDue(t *testing.T) {
 	connectedAt := time.Now().UTC()
 	dueAt := connectedAt.Add(models.ManualReloginPromptDelay)
 	account := models.GoogleAccount{
+		ID:                     77,
 		TelegramUserID:         123,
 		GmailEmail:             "user@example.com",
 		AccessToken:            "access-token",
@@ -197,6 +200,7 @@ func TestHandleInvalidGrantNotifiesUserAndDisconnectsAccount(t *testing.T) {
 	notifier := &dummyNotifier{}
 	poller := NewGmailPoller(StaticPollerSettings{Interval: 45 * time.Second}, database, dummyGmail{}, notifier)
 	account := models.GoogleAccount{
+		ID:             77,
 		TelegramUserID: 123,
 		GmailEmail:     "user@example.com",
 		AccessToken:    "access-token",
@@ -220,13 +224,14 @@ func TestHandleInvalidGrantNotifiesUserAndDisconnectsAccount(t *testing.T) {
 	if notifier.reloginRequests[0].chatID != 123 || notifier.reloginRequests[0].gmailEmail != "user@example.com" {
 		t.Fatalf("unexpected request: %+v", notifier.reloginRequests[0])
 	}
-	if len(database.deletedUserIDs) != 1 || database.deletedUserIDs[0] != 123 {
-		t.Fatalf("expected account deletion: %+v", database.deletedUserIDs)
+	if len(database.deletedAccountIDs) != 1 || database.deletedAccountIDs[0] != 77 {
+		t.Fatalf("expected account deletion: %+v", database.deletedAccountIDs)
 	}
 }
 
 func testPollerAccount() models.GoogleAccount {
 	return models.GoogleAccount{
+		ID:             77,
 		TelegramUserID: 123,
 		GmailEmail:     "user@example.com",
 		AccessToken:    "access-token",
