@@ -11,6 +11,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf16"
 
 	"github.com/BIGGASSS/gmail-bot/internal/config"
 	"github.com/BIGGASSS/gmail-bot/internal/database"
@@ -23,6 +24,9 @@ type fakeUpdateClient struct {
 	mu       sync.Mutex
 	messages []sentMessage
 	requests []tgbotapi.Chattable
+	// maxText, when set, rejects longer texts the way Telegram does.
+	maxText  int
+	rejected int
 }
 
 type sentMessage struct {
@@ -36,6 +40,17 @@ type sentMessage struct {
 func (f *fakeUpdateClient) Send(c tgbotapi.Chattable) (tgbotapi.Message, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	var text string
+	switch msg := c.(type) {
+	case tgbotapi.MessageConfig:
+		text = msg.Text
+	case tgbotapi.EditMessageTextConfig:
+		text = msg.Text
+	}
+	if f.maxText > 0 && len(utf16.Encode([]rune(text))) > f.maxText {
+		f.rejected++
+		return tgbotapi.Message{}, fmt.Errorf("Bad Request: message is too long")
+	}
 	switch msg := c.(type) {
 	case tgbotapi.MessageConfig:
 		f.messages = append(f.messages, sentMessage{

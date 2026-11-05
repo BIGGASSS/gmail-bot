@@ -163,8 +163,8 @@ func (b *Bot) handleStart(ctx context.Context, message *tgbotapi.Message) {
 		)
 	default:
 		text = fmt.Sprintf(
-			"Bot is active.\nConnected Gmail accounts: %s\nUse /status for connection details, /login to add another account, or /logout to disconnect.",
-			strings.Join(accountEmails(accounts), ", "),
+			"Bot is active.\nUse /status for connection details, /login to add another account, or /logout to disconnect.\nConnected Gmail accounts:\n%s",
+			strings.Join(accountEmails(accounts), "\n"),
 		)
 	}
 	b.reply(message.Chat.ID, text)
@@ -410,10 +410,16 @@ func (b *Bot) handleLogoutCallback(ctx context.Context, callback *tgbotapi.Callb
 		b.reply(owner, text)
 		return
 	}
-	// Replacing the text also removes the picker's buttons.
-	if _, err := b.api.Send(tgbotapi.NewEditMessageText(callback.Message.Chat.ID, callback.Message.MessageID, text)); err != nil {
+	// Replacing the text also removes the picker's buttons. A result too long for
+	// one message continues in follow-up messages.
+	chunks := SplitMessageText(text, TelegramTextLimit)
+	if _, err := b.api.Send(tgbotapi.NewEditMessageText(callback.Message.Chat.ID, callback.Message.MessageID, chunks[0])); err != nil {
 		applog.Errorf("Failed to update logout picker: %v", err)
 		b.reply(callback.Message.Chat.ID, text)
+		return
+	}
+	for _, chunk := range chunks[1:] {
+		b.reply(callback.Message.Chat.ID, chunk)
 	}
 }
 
@@ -433,11 +439,13 @@ func (b *Bot) revokeAndDescribe(ctx context.Context, removed []models.GoogleAcco
 		}
 		return fmt.Sprintf("Disconnected your Gmail account %s. Use /login to connect again.", removed[0].GmailEmail)
 	}
-	text := fmt.Sprintf("Disconnected your Gmail accounts: %s.", strings.Join(accountEmails(removed), ", "))
+	lines := []string{"Disconnected your Gmail accounts. Use /login to connect again."}
+	lines = append(lines, accountEmails(removed)...)
 	if len(failed) > 0 {
-		text += fmt.Sprintf(" Automatic forwarding has stopped, but Google token revocation failed for %s. Manually revoke this bot's access at https://myaccount.google.com/connections .", strings.Join(failed, ", "))
+		lines = append(lines, "", "Automatic forwarding has stopped, but Google token revocation failed for the accounts below. Manually revoke this bot's access at https://myaccount.google.com/connections .")
+		lines = append(lines, failed...)
 	}
-	return text + " Use /login to connect again."
+	return strings.Join(lines, "\n")
 }
 
 func (b *Bot) handleCallback(ctx context.Context, callback *tgbotapi.CallbackQuery) {
@@ -481,10 +489,14 @@ func (b *Bot) handleCallback(ctx context.Context, callback *tgbotapi.CallbackQue
 	b.answerCallback(callback.ID, "", false)
 }
 
+// reply sends plain text, split across messages at line breaks when it exceeds
+// Telegram's message length limit (for example, /status with many accounts).
 func (b *Bot) reply(chatID int64, text string) {
-	msg := tgbotapi.NewMessage(chatID, text)
-	if _, err := b.api.Send(msg); err != nil {
-		applog.Errorf("Failed to send Telegram message: %v", err)
+	for _, chunk := range SplitMessageText(text, TelegramTextLimit) {
+		if _, err := b.api.Send(tgbotapi.NewMessage(chatID, chunk)); err != nil {
+			applog.Errorf("Failed to send Telegram message: %v", err)
+			return
+		}
 	}
 }
 

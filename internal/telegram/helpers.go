@@ -3,6 +3,7 @@ package telegram
 import (
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 const ExpandPrefix = "expand:"
@@ -124,4 +125,79 @@ func isDecimal(value string) bool {
 		}
 	}
 	return true
+}
+
+// TelegramTextLimit is the maximum length of a Telegram message, which Telegram
+// counts in UTF-16 code units.
+const TelegramTextLimit = 4096
+
+// SplitMessageText splits plain text into chunks no longer than limit UTF-16
+// code units. It breaks at line boundaries and splits a line only when that
+// line alone exceeds the limit. It always returns at least one chunk.
+func SplitMessageText(text string, limit int) []string {
+	if utf16Len(text) <= limit {
+		return []string{text}
+	}
+	var chunks []string
+	var current strings.Builder
+	currentLen := 0
+	flush := func() {
+		if currentLen > 0 {
+			chunks = append(chunks, current.String())
+			current.Reset()
+			currentLen = 0
+		}
+	}
+	for _, line := range strings.Split(text, "\n") {
+		for _, piece := range splitLongLine(line, limit) {
+			pieceLen := utf16Len(piece)
+			if currentLen > 0 && currentLen+1+pieceLen > limit {
+				flush()
+			}
+			if currentLen > 0 {
+				current.WriteByte('\n')
+				currentLen++
+			}
+			current.WriteString(piece)
+			currentLen += pieceLen
+		}
+	}
+	flush()
+	if len(chunks) == 0 {
+		return []string{""}
+	}
+	return chunks
+}
+
+func splitLongLine(line string, limit int) []string {
+	if utf16Len(line) <= limit {
+		return []string{line}
+	}
+	var pieces []string
+	start, length := 0, 0
+	for i, r := range line {
+		width := 1
+		if r > 0xFFFF {
+			width = 2
+		}
+		if length+width > limit {
+			pieces = append(pieces, line[start:i])
+			start, length = i, 0
+		}
+		length += width
+	}
+	return append(pieces, line[start:])
+}
+
+func utf16Len(text string) int {
+	n := 0
+	for len(text) > 0 {
+		r, size := utf8.DecodeRuneInString(text)
+		text = text[size:]
+		n++
+		if r > 0xFFFF {
+			n++
+		}
+	}
+	return n
 }

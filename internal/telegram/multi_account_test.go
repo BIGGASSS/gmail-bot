@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -86,7 +87,7 @@ func TestStatusAndStartListEveryAccount(t *testing.T) {
 	if strings.Count(texts[0], "Manual reconnect reminder due:") != 2 {
 		t.Fatalf("status missing per-account due dates: %q", texts[0])
 	}
-	if !strings.Contains(texts[1], "Connected Gmail accounts: a@example.com, b@example.com") {
+	if !strings.Contains(texts[1], "Connected Gmail accounts:\na@example.com\nb@example.com") {
 		t.Fatalf("start=%q", texts[1])
 	}
 }
@@ -186,7 +187,7 @@ func TestLogoutAllButtonReportsRevocationFailures(t *testing.T) {
 		t.Fatalf("remaining=%+v", remaining)
 	}
 	texts := api.texts()
-	if len(texts) != 1 || !strings.Contains(texts[0], "a@example.com, b@example.com") || !strings.Contains(texts[0], "revocation failed") || !strings.Contains(texts[0], "https://myaccount.google.com/connections") {
+	if len(texts) != 1 || !strings.Contains(texts[0], "a@example.com\nb@example.com") || !strings.Contains(texts[0], "revocation failed") || !strings.Contains(texts[0], "https://myaccount.google.com/connections") {
 		t.Fatalf("texts=%v", texts)
 	}
 }
@@ -268,5 +269,48 @@ func TestExpandUsesAccountThatReceivedMessage(t *testing.T) {
 	}
 	if alerts := callbackAlerts(api); len(alerts) != 1 || !strings.Contains(alerts[0], "no longer available") {
 		t.Fatalf("alerts=%v", alerts)
+	}
+}
+
+func TestLongAccountListsStayWithinTelegramLimit(t *testing.T) {
+	ctx := context.Background()
+	db := openTelegramTestDB(t)
+	emails := make([]string, 200)
+	for i := range emails {
+		emails[i] = fmt.Sprintf("account%03d@example.com", i)
+	}
+	seedAccounts(t, db, 1, emails...)
+	api := &fakeUpdateClient{maxText: TelegramTextLimit}
+	bot := newTestBot(t, api, &fakeRevoker{}, db)
+
+	for _, command := range []string{"/status", "/start", "/relogin_reminder days 3"} {
+		api.messages = nil
+		bot.HandleUpdate(ctx, commandUpdate(1, 1, command))
+		texts := api.texts()
+		if len(texts) < 2 {
+			t.Fatalf("%s was not split: %d messages", command, len(texts))
+		}
+		joined := strings.Join(texts, "\n")
+		for _, email := range emails {
+			if !strings.Contains(joined, email) {
+				t.Fatalf("%s lost %s", command, email)
+			}
+		}
+	}
+	if api.rejected != 0 {
+		t.Fatalf("Telegram would reject %d oversized messages", api.rejected)
+	}
+
+	// Disconnecting every account edits the picker, then continues in new messages.
+	api.messages = nil
+	bot.HandleUpdate(ctx, callbackUpdate(1, 1, 7, BuildLogoutCallbackData(1, LogoutAllAccounts)))
+	if api.rejected != 0 || len(api.messages) < 2 || !api.messages[0].edit || api.messages[1].edit {
+		t.Fatalf("rejected=%d messages=%d", api.rejected, len(api.messages))
+	}
+	joined := strings.Join(api.texts(), "\n")
+	for _, email := range emails {
+		if !strings.Contains(joined, email) {
+			t.Fatalf("logout result lost %s", email)
+		}
 	}
 }
