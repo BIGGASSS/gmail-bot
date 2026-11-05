@@ -55,3 +55,17 @@ func TestParseReloginReminderDelayDays(t *testing.T) {
 		t.Fatal("expected nil for days nope")
 	}
 }
+
+func TestLogoutCallbackDataRoundTrip(t *testing.T) {
+	for _, accountID := range []int64{LogoutAllAccounts, 17} {
+		user, got, ok := ParseLogoutCallbackData(BuildLogoutCallbackData(123456789, accountID))
+		if !ok || user != 123456789 || got != accountID {
+			t.Fatalf("account %d: user=%d got=%d ok=%v", accountID, user, got, ok)
+		}
+	}
+	for _, bad := range []string{"logout:", "logout:1", "logout:x:all", "logout:1:-3", "logout:1:0", "logout:1:abc", "expand:1:all"} {
+		if _, _, ok := ParseLogoutCallbackData(bad); ok {
+			t.Fatalf("parsed malformed data %q", bad)
+		}
+	}
+}

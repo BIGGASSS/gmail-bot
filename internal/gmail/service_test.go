@@ -36,29 +36,29 @@ func newMemoryStore() *memoryStore {
 	}
 }
 
-func (m *memoryStore) UpdateTokens(ctx context.Context, telegramUserID int64, accessToken string, tokenExpiry time.Time, refreshToken *string) error {
+func (m *memoryStore) UpdateTokens(ctx context.Context, accountID int64, accessToken string, tokenExpiry time.Time, refreshToken *string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	snap := m.tokens[telegramUserID]
+	snap := m.tokens[accountID]
 	snap.accessToken = accessToken
 	snap.expiry = tokenExpiry
 	if refreshToken != nil {
 		snap.refreshToken = *refreshToken
 	}
-	m.tokens[telegramUserID] = snap
+	m.tokens[accountID] = snap
 	return nil
 }
 
-func (m *memoryStore) WasMessageDelivered(ctx context.Context, telegramUserID int64, gmailMessageID string) (bool, error) {
+func (m *memoryStore) WasMessageDelivered(ctx context.Context, accountID int64, gmailMessageID string) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.delivered[key(telegramUserID, gmailMessageID)], nil
+	return m.delivered[key(accountID, gmailMessageID)], nil
 }
 
-func (m *memoryStore) markDelivered(telegramUserID int64, gmailMessageID string) {
+func (m *memoryStore) markDelivered(accountID int64, gmailMessageID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.delivered[key(telegramUserID, gmailMessageID)] = true
+	m.delivered[key(accountID, gmailMessageID)] = true
 }
 
 func key(userID int64, messageID string) string {
@@ -159,6 +159,7 @@ func TestListNewInboxMessagesPaginatesAndFilters(t *testing.T) {
 	service := newTestService(t, server.URL, store)
 	connectedAt := time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)
 	account := models.GoogleAccount{
+		ID:             7,
 		TelegramUserID: 7,
 		GmailEmail:     "user@example.com",
 		AccessToken:    "access-token",
@@ -221,6 +222,7 @@ func TestListNewInboxMessagesCapsMessageCount(t *testing.T) {
 
 	service := newTestService(t, server.URL, store)
 	account := models.GoogleAccount{
+		ID:             7,
 		TelegramUserID: 7,
 		AccessToken:    "access-token",
 		RefreshToken:   "refresh-token",
@@ -240,7 +242,7 @@ func TestListNewInboxMessagesCapsMessageCount(t *testing.T) {
 		t.Fatalf("partial record advanced cursor: %q", latest)
 	}
 	for _, message := range messages {
-		store.markDelivered(account.TelegramUserID, message.GmailMessageID)
+		store.markDelivered(account.ID, message.GmailMessageID)
 	}
 	account.LastHistoryID = latest
 	messages, latest, err = service.ListNewInboxMessages(context.Background(), account)
@@ -248,10 +250,10 @@ func TestListNewInboxMessagesCapsMessageCount(t *testing.T) {
 		t.Fatalf("second poll: count=%d cursor=%q err=%v", len(messages), latest, err)
 	}
 	for _, message := range messages {
-		if delivered, _ := store.WasMessageDelivered(context.Background(), account.TelegramUserID, message.GmailMessageID); delivered {
+		if delivered, _ := store.WasMessageDelivered(context.Background(), account.ID, message.GmailMessageID); delivered {
 			t.Fatalf("duplicate notification: %s", message.GmailMessageID)
 		}
-		store.markDelivered(account.TelegramUserID, message.GmailMessageID)
+		store.markDelivered(account.ID, message.GmailMessageID)
 	}
 	if len(store.delivered) != 60 {
 		t.Fatalf("delivered %d of 60 messages", len(store.delivered))
@@ -308,6 +310,7 @@ func TestListNewInboxMessagesCapsHistoryPages(t *testing.T) {
 
 	service := newTestService(t, server.URL, store)
 	account := models.GoogleAccount{
+		ID:             7,
 		TelegramUserID: 7,
 		AccessToken:    "access-token",
 		RefreshToken:   "refresh-token",
@@ -330,7 +333,7 @@ func TestListNewInboxMessagesCapsHistoryPages(t *testing.T) {
 		t.Fatalf("expected %d messages, got %d", maxHistoryPages, len(messages))
 	}
 	for _, message := range messages {
-		store.markDelivered(account.TelegramUserID, message.GmailMessageID)
+		store.markDelivered(account.ID, message.GmailMessageID)
 	}
 	account.LastHistoryID = latest
 	messages, latest, err = service.ListNewInboxMessages(context.Background(), account)
@@ -338,7 +341,7 @@ func TestListNewInboxMessagesCapsHistoryPages(t *testing.T) {
 		t.Fatalf("second poll: count=%d cursor=%q calls=%d err=%v", len(messages), latest, historyCalls, err)
 	}
 	for _, message := range messages {
-		store.markDelivered(account.TelegramUserID, message.GmailMessageID)
+		store.markDelivered(account.ID, message.GmailMessageID)
 	}
 	if len(store.delivered) != 13 {
 		t.Fatalf("delivered %d of 13 messages", len(store.delivered))
@@ -392,7 +395,7 @@ func TestListNewInboxMessagesResumesRecordsAcrossPolls(t *testing.T) {
 			defer server.Close()
 			service := newTestService(t, server.URL, store)
 			account := models.GoogleAccount{
-				TelegramUserID: 7, AccessToken: "access-token",
+				ID: 7, TelegramUserID: 7, AccessToken: "access-token",
 				TokenExpiry: time.Now().Add(time.Hour), LastHistoryID: "100",
 				ConnectedAt: received.Add(-time.Hour),
 			}
@@ -406,10 +409,10 @@ func TestListNewInboxMessagesResumesRecordsAcrossPolls(t *testing.T) {
 					t.Fatalf("poll %d: %d metadata requests", poll, metadataCalls)
 				}
 				for _, message := range messages {
-					if delivered, _ := store.WasMessageDelivered(context.Background(), account.TelegramUserID, message.GmailMessageID); delivered {
+					if delivered, _ := store.WasMessageDelivered(context.Background(), account.ID, message.GmailMessageID); delivered {
 						t.Fatalf("duplicate notification: %s", message.GmailMessageID)
 					}
-					store.markDelivered(account.TelegramUserID, message.GmailMessageID)
+					store.markDelivered(account.ID, message.GmailMessageID)
 				}
 				account.LastHistoryID = cursor
 			}
@@ -450,7 +453,7 @@ func TestListNewInboxMessagesLargeFilteredRecordMakesProgress(t *testing.T) {
 	defer server.Close()
 	service := newTestService(t, server.URL, store)
 	account := models.GoogleAccount{
-		TelegramUserID: 7, AccessToken: "access-token",
+		ID: 7, TelegramUserID: 7, AccessToken: "access-token",
 		TokenExpiry: time.Now().Add(time.Hour), LastHistoryID: "100",
 		ConnectedAt: received.Add(-time.Hour),
 	}
@@ -464,7 +467,7 @@ func TestListNewInboxMessagesLargeFilteredRecordMakesProgress(t *testing.T) {
 			t.Fatalf("poll %d: count=%d cursor=%q err=%v", poll, len(messages), cursor, err)
 		}
 		for _, message := range messages {
-			store.markDelivered(account.TelegramUserID, message.GmailMessageID)
+			store.markDelivered(account.ID, message.GmailMessageID)
 		}
 		account.LastHistoryID = cursor
 	}
@@ -492,6 +495,7 @@ func TestListNewInboxMessagesHistoryExpired(t *testing.T) {
 
 	service := newTestService(t, server.URL, store)
 	account := models.GoogleAccount{
+		ID:             1,
 		TelegramUserID: 1,
 		AccessToken:    "access-token",
 		RefreshToken:   "refresh-token",
@@ -544,6 +548,7 @@ func TestRequestJSONRefreshesExpiredTokenBeforeRequest(t *testing.T) {
 
 	service := newTestServiceWithTokenURL(t, server.URL, store)
 	account := models.GoogleAccount{
+		ID:             9,
 		TelegramUserID: 9,
 		AccessToken:    "expired-access",
 		RefreshToken:   "refresh-token",
@@ -601,6 +606,7 @@ func TestRequestJSONRetriesOnceAfter401(t *testing.T) {
 
 	service := newTestServiceWithTokenURL(t, server.URL, store)
 	account := models.GoogleAccount{
+		ID:             11,
 		TelegramUserID: 11,
 		AccessToken:    "stale-access",
 		RefreshToken:   "refresh-token",

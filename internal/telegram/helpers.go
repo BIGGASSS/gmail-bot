@@ -7,6 +7,43 @@ import (
 
 const ExpandPrefix = "expand:"
 
+// LogoutPrefix starts callback data for the /logout account picker:
+// logout:<telegram user ID>:<account ID or "all">. The user ID stops someone else
+// in a group chat from pressing another user's button.
+const LogoutPrefix = "logout:"
+
+// LogoutAllAccounts is the account ID that stands for every connected account.
+const LogoutAllAccounts int64 = 0
+
+func BuildLogoutCallbackData(telegramUserID, accountID int64) string {
+	target := "all"
+	if accountID != LogoutAllAccounts {
+		target = strconv.FormatInt(accountID, 10)
+	}
+	return LogoutPrefix + strconv.FormatInt(telegramUserID, 10) + ":" + target
+}
+
+// ParseLogoutCallbackData returns the owning user and the account ID, which is
+// LogoutAllAccounts for the "All accounts" button.
+func ParseLogoutCallbackData(callbackData string) (int64, int64, bool) {
+	owner, target, found := strings.Cut(strings.TrimPrefix(callbackData, LogoutPrefix), ":")
+	if !found || !strings.HasPrefix(callbackData, LogoutPrefix) {
+		return 0, 0, false
+	}
+	user, err := strconv.ParseInt(owner, 10, 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	if target == "all" {
+		return user, LogoutAllAccounts, true
+	}
+	accountID, err := strconv.ParseInt(target, 10, 64)
+	if err != nil || accountID <= 0 {
+		return 0, 0, false
+	}
+	return user, accountID, true
+}
+
 func BuildExpandCallbackData(gmailMessageID string, pageIndex int) string {
 	if pageIndex == 0 {
 		return ExpandPrefix + gmailMessageID

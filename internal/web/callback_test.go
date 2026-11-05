@@ -71,7 +71,7 @@ func TestCallbackSuccessfulConnection(t *testing.T) {
 		t.Fatalf("success notifications=%v", notifier.successes)
 	}
 
-	account, err := db.GetGoogleAccount(ctx, 42)
+	account, err := userAccount(ctx, db, 42)
 	if err != nil || account == nil {
 		t.Fatalf("account err=%v account=%v", err, account)
 	}
@@ -101,13 +101,33 @@ func TestCallbackSuccessfulConnection(t *testing.T) {
 	}
 }
 
-func TestCallbackReusesExistingRefreshToken(t *testing.T) {
-	db := openDB(t)
-	ctx := context.Background()
+func callbackUpstream(t *testing.T, email string) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"access_token":  "new-access",
+			"refresh_token": "new-refresh",
+			"expires_in":    3600,
+		})
+	})
+	mux.HandleFunc("/gmail/v1/users/me/profile", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"emailAddress": email,
+			"historyId":    "99",
+		})
+	})
+	upstream := httptest.NewServer(mux)
+	t.Cleanup(upstream.Close)
+	return upstream
+}
+
+func seedAccount(t *testing.T, db *database.Database, user int64, email string) int64 {
+	t.Helper()
 	now := database.UTCNow()
-	if err := db.UpsertGoogleAccount(ctx, database.UpsertGoogleAccountParams{
-		TelegramUserID:         42,
-		GmailEmail:             "old@example.com",
+	id, err := db.UpsertGoogleAccount(context.Background(), database.UpsertGoogleAccountParams{
+		TelegramUserID:         user,
+		GmailEmail:             email,
 		AccessToken:            "old-access",
 		RefreshToken:           "existing-refresh",
 		TokenExpiry:            now.Add(time.Hour),
@@ -115,45 +135,65 @@ func TestCallbackReusesExistingRefreshToken(t *testing.T) {
 		ConnectedAt:            now.Add(-24 * time.Hour),
 		ReloginPromptEnabled:   true,
 		ReloginPromptDelayDays: 6,
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("seed account: %v", err)
 	}
-	if err := db.StoreOAuthState(ctx, "state-refresh", 42, now.Add(15*time.Minute)); err != nil {
-		t.Fatalf("store state: %v", err)
+	return id
+}
+
+func TestCallbackAddsSecondAccount(t *testing.T) {
+	db := openDB(t)
+	ctx := context.Background()
+	existingID := seedAccount(t, db, 42, "personal@example.com")
+	if err := db.StoreOAuthState(ctx, "state-add", 42, database.UTCNow().Add(15*time.Minute)); err != nil {
+		t.Fatal(err)
 	}
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"access_token": "new-access",
-			"expires_in":   3600,
-		})
-	})
-	mux.HandleFunc("/gmail/v1/users/me/profile", func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"emailAddress": "old@example.com",
-			"historyId":    "99",
-		})
-	})
-	upstream := httptest.NewServer(mux)
-	defer upstream.Close()
-
-	server := newServerWithUpstream(t, db, &captureNotifier{}, upstream.URL)
-	req := httptest.NewRequest(http.MethodGet, "/oauth/google/callback?state=state-refresh&code=code", nil)
+	notifier := &captureNotifier{}
+	server := newServerWithUpstream(t, db, notifier, callbackUpstream(t, "work@example.com").URL)
 	rec := httptest.NewRecorder()
-	server.Handler().ServeHTTP(rec, req)
+	server.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/oauth/google/callback?state=state-add&code=code", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	account, err := db.GetGoogleAccount(ctx, 42)
+	if len(notifier.successes) != 1 || notifier.successes[0] != "work@example.com" {
+		t.Fatalf("successes=%v", notifier.successes)
+	}
+	accounts, err := db.ListGoogleAccountsForUser(ctx, 42)
+	if err != nil || len(accounts) != 2 {
+		t.Fatalf("accounts=%+v err=%v", accounts, err)
+	}
+	if accounts[0].ID != existingID || accounts[0].AccessToken != "old-access" || accounts[0].RefreshToken != "existing-refresh" {
+		t.Fatalf("existing account changed: %+v", accounts[0])
+	}
+	if accounts[1].GmailEmail != "work@example.com" || accounts[1].RefreshToken != "new-refresh" || accounts[1].LastHistoryID != "99" {
+		t.Fatalf("new account=%+v", accounts[1])
+	}
+}
+
+func TestCallbackRejectsAlreadyConnectedAccount(t *testing.T) {
+	db := openDB(t)
+	ctx := context.Background()
+	seedAccount(t, db, 42, "old@example.com")
+	if err := db.StoreOAuthState(ctx, "state-dup", 42, database.UTCNow().Add(15*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	notifier := &captureNotifier{}
+	server := newServerWithUpstream(t, db, notifier, callbackUpstream(t, "Old@Example.com").URL)
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/oauth/google/callback?state=state-dup&code=code", nil))
+	if rec.Code == http.StatusOK {
+		t.Fatalf("duplicate account accepted: %s", rec.Body.String())
+	}
+	if len(notifier.successes) != 0 || len(notifier.failures) != 1 || !strings.Contains(notifier.failures[0], "already connected") || !strings.Contains(notifier.failures[0], "/logout") {
+		t.Fatalf("successes=%v failures=%v", notifier.successes, notifier.failures)
+	}
+	account, err := userAccount(ctx, db, 42)
 	if err != nil || account == nil {
-		t.Fatalf("account: %v", err)
+		t.Fatalf("account: %+v %v", account, err)
 	}
-	if account.RefreshToken != "existing-refresh" {
-		t.Fatalf("refresh token lost: %q", account.RefreshToken)
-	}
-	if account.AccessToken != "new-access" || account.GmailEmail != "old@example.com" {
-		t.Fatalf("account not updated: %+v", account)
+	if account.AccessToken != "old-access" || account.RefreshToken != "existing-refresh" || account.LastHistoryID != "1" {
+		t.Fatalf("credentials changed: %+v", account)
 	}
 }
 
@@ -161,7 +201,7 @@ func TestCallbackRejectsDifferentAccountWithoutNewRefreshToken(t *testing.T) {
 	db := openDB(t)
 	ctx := context.Background()
 	now := database.UTCNow()
-	if err := db.UpsertGoogleAccount(ctx, database.UpsertGoogleAccountParams{
+	if _, err := db.UpsertGoogleAccount(ctx, database.UpsertGoogleAccountParams{
 		TelegramUserID:         42,
 		GmailEmail:             "old@example.com",
 		AccessToken:            "old-access",
@@ -202,7 +242,7 @@ func TestCallbackRejectsDifferentAccountWithoutNewRefreshToken(t *testing.T) {
 	if len(notifier.failures) != 1 || !strings.Contains(notifier.failures[0], "refresh token") {
 		t.Fatalf("failures=%v", notifier.failures)
 	}
-	account, err := db.GetGoogleAccount(ctx, 42)
+	account, err := userAccount(ctx, db, 42)
 	if err != nil || account == nil {
 		t.Fatal(err)
 	}
@@ -217,9 +257,9 @@ func TestInflightCallbackInvalidation(t *testing.T) {
 			ctx := context.Background()
 			db := openDB(t)
 			now := database.UTCNow()
-			if err := db.UpsertGoogleAccount(ctx, database.UpsertGoogleAccountParams{
+			if _, err := db.UpsertGoogleAccount(ctx, database.UpsertGoogleAccountParams{
 				TelegramUserID: 42,
-				GmailEmail:     "user@example.com",
+				GmailEmail:     "seed@example.com",
 				AccessToken:    "old",
 				RefreshToken:   "old-refresh",
 				TokenExpiry:    now,
@@ -258,7 +298,7 @@ func TestInflightCallbackInvalidation(t *testing.T) {
 			}()
 			<-entered
 			if action == "logout" {
-				if _, err := db.Logout(ctx, 42); err != nil {
+				if _, err := db.LogoutAll(ctx, 42); err != nil {
 					t.Fatal(err)
 				}
 			} else {
@@ -287,18 +327,23 @@ func TestInflightCallbackInvalidation(t *testing.T) {
 			if status := <-done; status == http.StatusOK {
 				t.Fatal("stale callback succeeded")
 			}
-			account, err := db.GetGoogleAccount(ctx, 42)
+			accounts, err := db.ListGoogleAccountsForUser(ctx, 42)
 			if err != nil {
 				t.Fatal(err)
 			}
 			if action == "logout" {
-				if account != nil {
-					t.Fatal("callback undid logout")
+				if len(accounts) != 0 {
+					t.Fatalf("callback undid logout: %+v", accounts)
 				}
 				return
 			}
-			if account == nil || account.AccessToken == "stale" {
-				t.Fatal("stale callback overwrote authorization")
+			for _, account := range accounts {
+				if account.AccessToken == "stale" {
+					t.Fatal("stale callback stored authorization")
+				}
+			}
+			if action == "new completion" && len(accounts) != 2 {
+				t.Fatalf("winning login missing: %+v", accounts)
 			}
 		})
 	}
@@ -333,7 +378,7 @@ func TestCallbackMissingRefreshTokenFails(t *testing.T) {
 	if !strings.Contains(notifier.failures[0], "refresh token") {
 		t.Fatalf("failure=%q", notifier.failures[0])
 	}
-	account, err := db.GetGoogleAccount(ctx, 7)
+	account, err := userAccount(ctx, db, 7)
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
@@ -354,7 +399,7 @@ func TestCallbackRejectsRetiredRelogWithoutReplacingAccount(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := database.UTCNow()
-	if err := db.UpsertGoogleAccount(ctx, database.UpsertGoogleAccountParams{
+	if _, err := db.UpsertGoogleAccount(ctx, database.UpsertGoogleAccountParams{
 		TelegramUserID:         42,
 		GmailEmail:             "user@example.com",
 		AccessToken:            "old-access",
@@ -408,7 +453,7 @@ func TestCallbackRejectsRetiredRelogWithoutReplacingAccount(t *testing.T) {
 	if len(notifier.failures) != 1 || !strings.Contains(notifier.failures[0], "/logout") {
 		t.Fatalf("failures=%v", notifier.failures)
 	}
-	account, err := db.GetGoogleAccount(ctx, 42)
+	account, err := userAccount(ctx, db, 42)
 	if err != nil || account == nil {
 		t.Fatal(err)
 	}

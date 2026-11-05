@@ -14,7 +14,10 @@ type OAuthState struct {
 	ExpiresAt      time.Time
 }
 
+// GoogleAccount is one Gmail mailbox connected by a Telegram user.
+// A Telegram user may connect several accounts; ID identifies the row.
 type GoogleAccount struct {
+	ID                     int64
 	Generation             int64
 	TelegramUserID         int64
 	GmailEmail             string

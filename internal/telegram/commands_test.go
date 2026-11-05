@@ -29,6 +29,8 @@ type sentMessage struct {
 	chatID    int64
 	text      string
 	parseMode string
+	markup    any
+	edit      bool
 }
 
 func (f *fakeUpdateClient) Send(c tgbotapi.Chattable) (tgbotapi.Message, error) {
@@ -40,6 +42,7 @@ func (f *fakeUpdateClient) Send(c tgbotapi.Chattable) (tgbotapi.Message, error) 
 			chatID:    msg.ChatID,
 			text:      msg.Text,
 			parseMode: msg.ParseMode,
+			markup:    msg.ReplyMarkup,
 		})
 		return tgbotapi.Message{MessageID: len(f.messages), Chat: &tgbotapi.Chat{ID: msg.ChatID}}, nil
 	case tgbotapi.EditMessageTextConfig:
@@ -47,6 +50,8 @@ func (f *fakeUpdateClient) Send(c tgbotapi.Chattable) (tgbotapi.Message, error) 
 			chatID:    msg.ChatID,
 			text:      msg.Text,
 			parseMode: msg.ParseMode,
+			markup:    msg.ReplyMarkup,
+			edit:      true,
 		})
 		return tgbotapi.Message{MessageID: msg.MessageID, Chat: &tgbotapi.Chat{ID: msg.ChatID}}, nil
 	default:
@@ -131,7 +136,7 @@ func TestStatusCommandThroughHandleUpdate(t *testing.T) {
 	ctx := context.Background()
 	db := openTelegramTestDB(t)
 	now := database.UTCNow()
-	if err := db.UpsertGoogleAccount(ctx, database.UpsertGoogleAccountParams{
+	if _, err := db.UpsertGoogleAccount(ctx, database.UpsertGoogleAccountParams{
 		TelegramUserID:         1,
 		GmailEmail:             "user@example.com",
 		AccessToken:            "access",
@@ -169,7 +174,7 @@ func TestLogoutCommandRevokesTokenAndDeletesAccount(t *testing.T) {
 	ctx := context.Background()
 	db := openTelegramTestDB(t)
 	now := database.UTCNow()
-	if err := db.UpsertGoogleAccount(ctx, database.UpsertGoogleAccountParams{
+	if _, err := db.UpsertGoogleAccount(ctx, database.UpsertGoogleAccountParams{
 		TelegramUserID:         1,
 		GmailEmail:             "user@example.com",
 		AccessToken:            "access",
@@ -192,7 +197,7 @@ func TestLogoutCommandRevokesTokenAndDeletesAccount(t *testing.T) {
 	if len(revoker.revoked) != 1 || revoker.revoked[0] != "refresh-token" {
 		t.Fatalf("revoked=%v", revoker.revoked)
 	}
-	account, err := db.GetGoogleAccount(ctx, 1)
+	account, err := userAccount(ctx, db, 1)
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
@@ -209,7 +214,7 @@ func TestLogoutStillDisconnectsWhenRevokeFails(t *testing.T) {
 	ctx := context.Background()
 	db := openTelegramTestDB(t)
 	now := database.UTCNow()
-	if err := db.UpsertGoogleAccount(ctx, database.UpsertGoogleAccountParams{
+	if _, err := db.UpsertGoogleAccount(ctx, database.UpsertGoogleAccountParams{
 		TelegramUserID:         1,
 		GmailEmail:             "user@example.com",
 		AccessToken:            "access",
@@ -227,7 +232,7 @@ func TestLogoutStillDisconnectsWhenRevokeFails(t *testing.T) {
 	bot := newTestBot(t, api, &fakeRevoker{fail: true}, db)
 	bot.HandleUpdate(ctx, commandUpdate(1, 1, "/logout"))
 
-	account, err := db.GetGoogleAccount(ctx, 1)
+	account, err := userAccount(ctx, db, 1)
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
@@ -267,7 +272,7 @@ func TestLogoutThroughRealOAuthRevokeHTTP(t *testing.T) {
 	ctx := context.Background()
 	db := openTelegramTestDB(t)
 	now := database.UTCNow()
-	if err := db.UpsertGoogleAccount(ctx, database.UpsertGoogleAccountParams{
+	if _, err := db.UpsertGoogleAccount(ctx, database.UpsertGoogleAccountParams{
 		TelegramUserID:         1,
 		GmailEmail:             "user@example.com",
 		AccessToken:            "access",
@@ -309,7 +314,7 @@ func TestLogoutThroughRealOAuthRevokeHTTP(t *testing.T) {
 	if revokedToken != "refresh-token" {
 		t.Fatalf("revokedToken=%q", revokedToken)
 	}
-	account, err := db.GetGoogleAccount(ctx, 1)
+	account, err := userAccount(ctx, db, 1)
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
@@ -385,7 +390,7 @@ func TestLogoutClearsStatesOnRevokeFailure(t *testing.T) {
 	ctx := context.Background()
 	db := openTelegramTestDB(t)
 	now := database.UTCNow()
-	if err := db.UpsertGoogleAccount(ctx, database.UpsertGoogleAccountParams{
+	if _, err := db.UpsertGoogleAccount(ctx, database.UpsertGoogleAccountParams{
 		TelegramUserID:         1,
 		GmailEmail:             "user@example.com",
 		AccessToken:            "access",
@@ -406,7 +411,7 @@ func TestLogoutClearsStatesOnRevokeFailure(t *testing.T) {
 	bot := newTestBot(t, api, &fakeRevoker{fail: true}, db)
 	bot.HandleUpdate(ctx, commandUpdate(1, 1, "/logout"))
 
-	account, err := db.GetGoogleAccount(ctx, 1)
+	account, err := userAccount(ctx, db, 1)
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
