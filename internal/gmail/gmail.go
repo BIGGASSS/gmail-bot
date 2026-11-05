@@ -209,6 +209,9 @@ func (s *Service) GetMessageSummary(ctx context.Context, account models.GoogleAc
 	params := url.Values{}
 	params.Set("format", "metadata")
 	params.Add("metadataHeaders", "From")
+	params.Add("metadataHeaders", "To")
+	params.Add("metadataHeaders", "Cc")
+	params.Add("metadataHeaders", "Delivered-To")
 	params.Add("metadataHeaders", "Subject")
 	params.Add("metadataHeaders", "Date")
 
@@ -254,6 +257,8 @@ func (s *Service) GetMessageSummary(ctx context.Context, account models.GoogleAc
 	return &models.IncomingMail{
 		GmailMessageID: gmailMessageID,
 		FromHeader:     from,
+		ToHeader:       recipientHeader(headers),
+		CcHeader:       headerValue(headers, "Cc"),
 		Subject:        subject,
 		Snippet:        snippet,
 		ReceivedAt:     internalDateToTime(payload["internalDate"]),
@@ -291,6 +296,8 @@ func (s *Service) GetExpandedMessage(ctx context.Context, account models.GoogleA
 	return models.ExpandedMail{
 		GmailMessageID: gmailMessageID,
 		FromHeader:     from,
+		ToHeader:       recipientHeader(headers),
+		CcHeader:       headerValue(headers, "Cc"),
 		Subject:        subject,
 		ReceivedAt:     internalDateToTime(payload["internalDate"]),
 		BodyText:       bodyText,
@@ -472,6 +479,15 @@ func headerValue(headers []map[string]any, name string) string {
 		return ""
 	}
 	return ""
+}
+
+// recipientHeader returns the visible To header, falling back to
+// Delivered-To so Bcc'd or list mail still shows which address received it.
+func recipientHeader(headers []map[string]any) string {
+	if to := strings.TrimSpace(headerValue(headers, "To")); to != "" {
+		return to
+	}
+	return strings.TrimSpace(headerValue(headers, "Delivered-To"))
 }
 
 func internalDateToTime(value any) time.Time {

@@ -53,6 +53,8 @@ type AttachmentMeta struct {
 type IncomingMail struct {
 	GmailMessageID string
 	FromHeader     string
+	ToHeader       string
+	CcHeader       string
 	Subject        string
 	Snippet        string
 	ReceivedAt     time.Time
@@ -61,6 +63,8 @@ type IncomingMail struct {
 type ExpandedMail struct {
 	GmailMessageID string
 	FromHeader     string
+	ToHeader       string
+	CcHeader       string
 	Subject        string
 	ReceivedAt     time.Time
 	BodyText       string

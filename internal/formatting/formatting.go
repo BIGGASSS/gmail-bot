@@ -769,14 +769,15 @@ func FormatMailNotification(mail models.IncomingMail) string {
 	if snippet == "" {
 		snippet = "(no preview available)"
 	}
-	return strings.Join([]string{
-		"New Gmail message",
-		"From: " + from,
-		"Subject: " + subject,
-		"Received: " + FormatTimestamp(mail.ReceivedAt),
+	lines := []string{"New Gmail message", "From: " + from}
+	lines = append(lines, formatRecipientLines(mail.ToHeader, mail.CcHeader)...)
+	lines = append(lines,
+		"Subject: "+subject,
+		"Received: "+FormatTimestamp(mail.ReceivedAt),
 		"",
-		"Snippet: " + snippet,
-	}, "\n")
+		"Snippet: "+snippet,
+	)
+	return strings.Join(lines, "\n")
 }
 
 func FormatExpandedMail(mail models.ExpandedMail) string {
@@ -794,20 +795,34 @@ func FormatExpandedMail(mail models.ExpandedMail) string {
 		subject = "(no subject)"
 	}
 	subject = SanitizeLinkTokenDelimiters(subject)
-	lines := []string{
-		"Expanded Gmail message",
-		"From: " + from,
-		"Subject: " + subject,
-		"Received: " + FormatTimestamp(mail.ReceivedAt),
+	lines := []string{"Expanded Gmail message", "From: " + from}
+	lines = append(lines, formatRecipientLines(mail.ToHeader, mail.CcHeader)...)
+	lines = append(lines,
+		"Subject: "+subject,
+		"Received: "+FormatTimestamp(mail.ReceivedAt),
 		"",
 		"Body:",
 		bodyText,
-	}
+	)
 	if len(mail.Attachments) > 0 {
 		lines = append(lines, "", "Attachments:")
 		lines = append(lines, FormatAttachmentLines(mail.Attachments)...)
 	}
 	return strings.Join(lines, "\n")
+}
+
+// formatRecipientLines renders the To line, plus a Cc line when the message
+// has carbon-copy recipients.
+func formatRecipientLines(to, cc string) []string {
+	to = strings.TrimSpace(to)
+	if to == "" {
+		to = "Unknown recipient"
+	}
+	lines := []string{"To: " + SanitizeLinkTokenDelimiters(to)}
+	if cc = strings.TrimSpace(cc); cc != "" {
+		lines = append(lines, "Cc: "+SanitizeLinkTokenDelimiters(cc))
+	}
+	return lines
 }
 
 func FormatAttachmentLines(attachments []models.AttachmentMeta) []string {
