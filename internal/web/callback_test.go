@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -22,6 +23,14 @@ import (
 )
 
 func TestCallbackSuccessfulConnection(t *testing.T) {
+	testCallbackSuccessfulConnection(t, nil)
+}
+
+func TestCallbackSucceedsWhenSuccessNotificationFails(t *testing.T) {
+	testCallbackSuccessfulConnection(t, errors.New("telegram down"))
+}
+
+func testCallbackSuccessfulConnection(t *testing.T, notifyErr error) {
 	db := openDB(t)
 	ctx := context.Background()
 	if err := db.StoreOAuthState(ctx, "state-ok", 42, database.UTCNow().Add(15*time.Minute)); err != nil {
@@ -54,7 +63,7 @@ func TestCallbackSuccessfulConnection(t *testing.T) {
 	upstream := httptest.NewServer(mux)
 	defer upstream.Close()
 
-	notifier := &captureNotifier{}
+	notifier := &captureNotifier{successErr: notifyErr}
 	server := newServerWithUpstream(t, db, notifier, upstream.URL)
 
 	req := httptest.NewRequest(http.MethodGet, "/oauth/google/callback?state=state-ok&code=auth-code", nil)
@@ -67,8 +76,8 @@ func TestCallbackSuccessfulConnection(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), "Gmail connected") {
 		t.Fatalf("body=%q", rec.Body.String())
 	}
-	if len(notifier.successes) != 1 || notifier.successes[0] != "connected@example.com" {
-		t.Fatalf("success notifications=%v", notifier.successes)
+	if len(notifier.successes) != 1 || notifier.successes[0] != "connected@example.com" || len(notifier.failures) != 0 {
+		t.Fatalf("success=%v failures=%v", notifier.successes, notifier.failures)
 	}
 
 	account, err := db.GetGoogleAccount(ctx, 42)

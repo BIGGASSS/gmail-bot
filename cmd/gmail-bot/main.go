@@ -86,6 +86,7 @@ func run() error {
 		notifier,
 	)
 
+	// Components return nil on cancellation, so any group error is real.
 	group, groupCtx := errgroup.WithContext(ctx)
 	group.Go(func() error {
 		return bot.Run(groupCtx)
@@ -97,8 +98,5 @@ func run() error {
 		return server.Run(groupCtx)
 	})
 
-	if err := group.Wait(); err != nil && groupCtx.Err() == nil {
-		return err
-	}
-	return nil
+	return group.Wait()
 }

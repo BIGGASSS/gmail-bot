@@ -19,10 +19,19 @@ func htmlReconstructionBomb(count int) string {
 	return input.String()
 }
 
+// distinctAttrs returns count attributes; x/net/html drops duplicate names.
+func distinctAttrs(count int, format string) string {
+	var out strings.Builder
+	for i := 0; i < count; i++ {
+		fmt.Fprintf(&out, format, i)
+	}
+	return out.String()
+}
+
 func TestHTMLCloneBudgetBeforeDOMAllocation(t *testing.T) {
 	for _, tt := range []struct{ name, input string }{
 		{"distinct formatting", htmlReconstructionBomb(2000)},
-		{"attribute slices", "<p><b " + strings.Repeat("x ", 1000) + ">" + strings.Repeat("<p>x", 2000)},
+		{"attribute slices", "<p><b " + distinctAttrs(1000, "x%d ") + ">" + strings.Repeat("<p>x", 2000)},
 		{"many incomplete tags", strings.Repeat("<b ", 2700)},
 		{"overlapping incomplete tags", strings.Repeat("<b ", 100) + strings.Repeat("x ", 3000)},
 		{"overlong formatting tag", `<b title="` + strings.Repeat("x", maxHTMLFormattingTagBytes) + `">Body</b>`},
@@ -61,8 +70,8 @@ func TestHTMLCloneBudgetConservativeScanning(t *testing.T) {
 		{"noscript", "<noscript/>" + bomb},
 		{"inside attribute", `<div title="` + bomb + `">Body</div>`},
 		{"inside comment", "<!--" + bomb + "-->Body"},
-		{"quoted greater than", `<p><b title=">" ` + strings.Repeat("x ", 1000) + ">" + strings.Repeat("<p>x", 2000)},
-		{"adjacent attributes", `<p><b ` + strings.Repeat(`x=""`, 1000) + ">" + strings.Repeat("<p>x", 2000)},
+		{"quoted greater than", `<p><b title=">" ` + distinctAttrs(1000, "x%d ") + ">" + strings.Repeat("<p>x", 2000)},
+		{"adjacent attributes", `<p><b ` + distinctAttrs(1000, `x%d=""`) + ">" + strings.Repeat("<p>x", 2000)},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			if got, err := HTMLToTelegramText(tt.input); !errors.Is(err, ErrHTMLResourceLimit) || got != "" {

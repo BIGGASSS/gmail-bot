@@ -33,6 +33,7 @@ func (n *Notifier) SendText(ctx context.Context, chatID int64, text string) erro
 	for _, chunk := range formatting.RenderAndChunk(text, formatting.SafeByteLimit) {
 		msg := tgbotapi.NewMessage(chatID, chunk)
 		msg.ParseMode = "HTML"
+		msg.DisableWebPagePreview = true
 		if _, err := n.bot.Send(msg); err != nil {
 			return NormalizeAPIError(err)
 		}
@@ -84,6 +85,7 @@ func (n *Notifier) SendMailNotification(ctx context.Context, chatID int64, mail 
 	)
 	msg := tgbotapi.NewMessage(chatID, text)
 	msg.ParseMode = "HTML"
+	msg.DisableWebPagePreview = true
 	msg.ReplyMarkup = keyboard
 	sent, err := n.bot.Send(msg)
 	if err != nil {
@@ -97,6 +99,7 @@ func (n *Notifier) SendExpandedMail(ctx context.Context, chatID int64, mail mode
 	for _, chunk := range formatting.RenderAndChunk(formatting.FormatExpandedMail(mail), formatting.SafeByteLimit) {
 		msg := tgbotapi.NewMessage(chatID, chunk)
 		msg.ParseMode = "HTML"
+		msg.DisableWebPagePreview = true
 		if _, err := n.bot.Send(msg); err != nil {
 			return NormalizeAPIError(err)
 		}
@@ -115,6 +118,7 @@ func (n *Notifier) EditExpandedMail(ctx context.Context, chatID int64, messageID
 	}
 	edit := tgbotapi.NewEditMessageText(chatID, messageID, chunks[pageIndex])
 	edit.ParseMode = "HTML"
+	edit.DisableWebPagePreview = true
 	if keyboard := buildExpandedPageKeyboard(mail.GmailMessageID, len(chunks)); keyboard != nil {
 		edit.ReplyMarkup = keyboard
 	}
@@ -128,14 +132,19 @@ func buildExpandedPageKeyboard(gmailMessageID string, pageCount int) *tgbotapi.I
 	if pageCount <= 1 {
 		return nil
 	}
-	buttons := make([]tgbotapi.InlineKeyboardButton, 0, pageCount)
+	// Telegram clients truncate long rows, so wrap page buttons.
+	const buttonsPerRow = 8
+	var rows [][]tgbotapi.InlineKeyboardButton
 	for pageNumber := 1; pageNumber <= pageCount; pageNumber++ {
-		buttons = append(buttons, tgbotapi.NewInlineKeyboardButtonData(
+		if (pageNumber-1)%buttonsPerRow == 0 {
+			rows = append(rows, nil)
+		}
+		rows[len(rows)-1] = append(rows[len(rows)-1], tgbotapi.NewInlineKeyboardButtonData(
 			fmt.Sprintf("%d", pageNumber),
 			BuildExpandCallbackData(gmailMessageID, pageNumber-1),
 		))
 	}
-	keyboard := tgbotapi.NewInlineKeyboardMarkup(buttons)
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(rows...)
 	return &keyboard
 }
 

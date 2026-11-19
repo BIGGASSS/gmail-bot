@@ -473,6 +473,38 @@ func TestListNewInboxMessagesLargeFilteredRecordMakesProgress(t *testing.T) {
 	}
 }
 
+func TestListNewInboxMessagesSkipsDeletedMessage(t *testing.T) {
+	store := newMemoryStore()
+	received := time.Date(2024, 2, 1, 0, 0, 0, 0, time.UTC)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/history") {
+			added := []any{
+				map[string]any{"message": map[string]any{"id": "gone"}},
+				map[string]any{"message": map[string]any{"id": "kept"}},
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"historyId": "300", "history": []any{map[string]any{"id": "200", "messagesAdded": added}}})
+			return
+		}
+		id := strings.TrimPrefix(r.URL.Path, "/gmail/v1/users/me/messages/")
+		if id == "gone" {
+			http.Error(w, `{"error":{"code":404}}`, http.StatusNotFound)
+			return
+		}
+		writeMessage(w, id, []string{"INBOX"}, "Kept", received)
+	}))
+	defer server.Close()
+	service := newTestService(t, server.URL, store)
+	account := models.GoogleAccount{
+		TelegramUserID: 7, AccessToken: "access-token",
+		TokenExpiry: time.Now().Add(time.Hour), LastHistoryID: "100",
+		ConnectedAt: received.Add(-time.Hour),
+	}
+	messages, cursor, err := service.ListNewInboxMessages(context.Background(), account)
+	if err != nil || cursor != "300" || len(messages) != 1 || messages[0].GmailMessageID != "kept" {
+		t.Fatalf("messages=%v cursor=%q err=%v", messages, cursor, err)
+	}
+}
+
 func TestListNewInboxMessagesHistoryExpired(t *testing.T) {
 	store := newMemoryStore()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

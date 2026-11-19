@@ -150,7 +150,7 @@ func (s *Server) handleGoogleCallback(w http.ResponseWriter, r *http.Request) {
 
 	if err := s.completeLogin(r.Context(), *oauthState, code); err != nil {
 		applog.Errorf("Failed to complete Gmail OAuth callback for Telegram user %d: %v", oauthState.TelegramUserID, err)
-		_ = s.notifier.SendLoginFailure(r.Context(), oauthState.TelegramUserID, err.Error())
+		_ = s.notifier.SendLoginFailure(r.Context(), oauthState.TelegramUserID, applog.RedactError(err))
 		writeHTML(w, http.StatusInternalServerError, "<html><body><h1>Gmail connection failed.</h1><p>Return to Telegram for details.</p></body></html>")
 		return
 	}
@@ -209,7 +209,11 @@ func (s *Server) completeLogin(ctx context.Context, state models.OAuthState, cod
 		return err
 	}
 
-	return s.notifier.SendLoginSuccess(ctx, telegramUserID, profile.EmailAddress)
+	// The account is committed; a failed notification must not report a failed login.
+	if err := s.notifier.SendLoginSuccess(ctx, telegramUserID, profile.EmailAddress); err != nil {
+		applog.Warningf("Failed to send login success to Telegram user %d: %s", telegramUserID, applog.RedactError(err))
+	}
+	return nil
 }
 
 func writeHTML(w http.ResponseWriter, status int, body string) {

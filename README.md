@@ -43,7 +43,7 @@ The bot requests `https://www.googleapis.com/auth/gmail.readonly`.
 
 ## Local run
 
-Requires Go 1.19 or newer.
+Requires Go 1.26 or newer.
 
 ```bash
 cp .env.example .env

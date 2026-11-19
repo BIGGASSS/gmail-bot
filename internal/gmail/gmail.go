@@ -175,6 +175,10 @@ func (s *Service) ListNewInboxMessages(ctx context.Context, account models.Googl
 					}
 					metadataRequests++
 					summary, err := s.GetMessageSummary(ctx, account, messageID)
+					if apiErr, ok := err.(*APIError); ok && apiErr.StatusCode == http.StatusNotFound {
+						// Permanently deleted since it was added; skip it.
+						continue
+					}
 					if err != nil {
 						return nil, "", err
 					}
