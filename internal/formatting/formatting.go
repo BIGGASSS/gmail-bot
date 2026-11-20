@@ -164,9 +164,8 @@ func StripHTML(value string) (string, error) {
 }
 
 // HTMLToTelegramText converts email HTML to text with safe link tokens.
-// Sources over 2 MiB, 4096 '<' delimiters, or the conservative formatting-clone
-// budget return ErrHTMLResourceLimit. Formatting-tag preflight also caps each
-// candidate at 8 KiB and cumulative scanning at 128 KiB, including overlaps.
+// Sources over 2 MiB or 4096 '<' delimiters, or nesting more than 512 open
+// elements, return ErrHTMLResourceLimit.
 // Parsing failures return an error, never a partial or fallback body.
 func HTMLToTelegramText(value string) (string, error) {
 	return extractHTMLText(value, true)
@@ -174,8 +173,8 @@ func HTMLToTelegramText(value string) (string, error) {
 
 func extractHTMLText(value string, preserveAnchorTextLinks bool) (string, error) {
 	// Bound source processing before tokenization. Count delimiters in comments,
-	// attributes and text too. These limits alone do not bound DOM allocation:
-	// HTML5 formatting reconstruction needs a separate amplification budget.
+	// attributes and text too. With formatting elements neutralized below, the
+	// DOM is linear in the source, so these limits also bound DOM allocation.
 	if len(value) > maxHTMLBytes || strings.Count(value, "<") > maxHTMLMarkup {
 		return "", ErrHTMLResourceLimit
 	}
@@ -186,11 +185,13 @@ func extractHTMLText(value string, preserveAnchorTextLinks bool) (string, error)
 	if err != nil {
 		return "", fmt.Errorf("filter email HTML conditionals: %w", err)
 	}
-	if err := checkHTMLCloneBudget(filtered); err != nil {
-		return "", err
-	}
+	filtered = neutralizeHTMLFormattingTags(filtered)
 	doc, err := nethtml.ParseWithOptions(strings.NewReader(filtered), nethtml.ParseOptionEnableScripting(false))
 	if err != nil {
+		// x/net/html rejects more than 512 open elements with an unexported error.
+		if strings.Contains(err.Error(), "open stack of elements exceeds") {
+			return "", ErrHTMLResourceLimit
+		}
 		return "", fmt.Errorf("parse email HTML: %w", err)
 	}
 	w := htmlTextWriter{links: preserveAnchorTextLinks}
@@ -321,7 +322,7 @@ func (w *htmlTextWriter) walk(n *nethtml.Node, pre bool) {
 	switch n.Type {
 	case nethtml.TextNode:
 		if !w.invisible {
-			w.text(n.Data, pre)
+			w.text(htmlTextNodeData(n), pre)
 		}
 		return
 	case nethtml.DocumentNode:
@@ -357,7 +358,7 @@ func (w *htmlTextWriter) walk(n *nethtml.Node, pre bool) {
 		w.boundary(2)
 		w.children(n, true)
 		w.boundary(2)
-	case "a":
+	case htmlAnchorTag:
 		// Foreign/malformed markup can retain nested anchors in the DOM. Never
 		// encode a token inside another token's label.
 		if w.inAnchor {
@@ -501,7 +502,7 @@ func (w *htmlTextWriter) flatten(n *nethtml.Node, pre bool) {
 		switch n.Type {
 		case nethtml.TextNode:
 			if !v.invisible {
-				w.text(n.Data, v.pre)
+				w.text(htmlTextNodeData(n), v.pre)
 			}
 			continue
 		case nethtml.ElementNode:
@@ -511,7 +512,7 @@ func (w *htmlTextWriter) flatten(n *nethtml.Node, pre bool) {
 			}
 			v.invisible = invisible
 			switch n.Data {
-			case "a":
+			case htmlAnchorTag:
 				if !w.inAnchor {
 					inherited := w.invisible
 					w.invisible = v.invisible
@@ -557,7 +558,7 @@ func (w *htmlTextWriter) flatten(n *nethtml.Node, pre bool) {
 func htmlAttribute(n *nethtml.Node, key string) (string, bool) {
 	for _, attr := range n.Attr {
 		if attr.Key == key {
-			return attr.Val, true
+			return restoreHTMLFormattingTags(attr.Val), true
 		}
 	}
 	return "", false
@@ -773,14 +774,15 @@ func FormatMailNotification(mail models.IncomingMail) string {
 	if snippet == "" {
 		snippet = "(no preview available)"
 	}
-	return strings.Join([]string{
-		"New Gmail message",
-		"From: " + from,
-		"Subject: " + subject,
-		"Received: " + FormatTimestamp(mail.ReceivedAt),
+	lines := []string{"New Gmail message", "From: " + from}
+	lines = append(lines, formatRecipientLines(mail.ToHeader, mail.CcHeader)...)
+	lines = append(lines,
+		"Subject: "+subject,
+		"Received: "+FormatTimestamp(mail.ReceivedAt),
 		"",
-		"Snippet: " + snippet,
-	}, "\n")
+		"Snippet: "+snippet,
+	)
+	return strings.Join(lines, "\n")
 }
 
 func FormatExpandedMail(mail models.ExpandedMail) string {
@@ -798,20 +800,34 @@ func FormatExpandedMail(mail models.ExpandedMail) string {
 		subject = "(no subject)"
 	}
 	subject = SanitizeLinkTokenDelimiters(subject)
-	lines := []string{
-		"Expanded Gmail message",
-		"From: " + from,
-		"Subject: " + subject,
-		"Received: " + FormatTimestamp(mail.ReceivedAt),
+	lines := []string{"Expanded Gmail message", "From: " + from}
+	lines = append(lines, formatRecipientLines(mail.ToHeader, mail.CcHeader)...)
+	lines = append(lines,
+		"Subject: "+subject,
+		"Received: "+FormatTimestamp(mail.ReceivedAt),
 		"",
 		"Body:",
 		bodyText,
-	}
+	)
 	if len(mail.Attachments) > 0 {
 		lines = append(lines, "", "Attachments:")
 		lines = append(lines, FormatAttachmentLines(mail.Attachments)...)
 	}
 	return strings.Join(lines, "\n")
+}
+
+// formatRecipientLines renders the To line, plus a Cc line when the message
+// has carbon-copy recipients.
+func formatRecipientLines(to, cc string) []string {
+	to = strings.TrimSpace(to)
+	if to == "" {
+		to = "Unknown recipient"
+	}
+	lines := []string{"To: " + SanitizeLinkTokenDelimiters(to)}
+	if cc = strings.TrimSpace(cc); cc != "" {
+		lines = append(lines, "Cc: "+SanitizeLinkTokenDelimiters(cc))
+	}
+	return lines
 }
 
 func FormatAttachmentLines(attachments []models.AttachmentMeta) []string {

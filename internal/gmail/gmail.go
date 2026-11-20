@@ -55,9 +55,10 @@ func (e *HistoryExpiredError) StatusCode() int {
 	return 404
 }
 
+// TokenStore persists per-account credentials and delivery state, keyed by account ID.
 type TokenStore interface {
-	UpdateTokens(ctx context.Context, telegramUserID int64, accessToken string, tokenExpiry time.Time, refreshToken *string) error
-	WasMessageDelivered(ctx context.Context, telegramUserID int64, gmailMessageID string) (bool, error)
+	UpdateTokens(ctx context.Context, accountID int64, accessToken string, tokenExpiry time.Time, refreshToken *string) error
+	WasMessageDelivered(ctx context.Context, accountID int64, gmailMessageID string) (bool, error)
 }
 
 type Service struct {
@@ -110,7 +111,7 @@ func (s *Service) ListNewInboxMessages(ctx context.Context, account models.Googl
 	for {
 		pages++
 		if pages > maxHistoryPages {
-			applog.Warningf("Gmail history fanout cap reached for Telegram user %d: processed %d pages.", account.TelegramUserID, maxHistoryPages)
+			applog.Warningf("Gmail history fanout cap reached for account %d (Telegram user %d): processed %d pages.", account.ID, account.TelegramUserID, maxHistoryPages)
 			break
 		}
 		params := url.Values{}
@@ -161,7 +162,7 @@ func (s *Service) ListNewInboxMessages(ctx context.Context, account models.Googl
 						continue
 					}
 					messageIDs[messageID] = struct{}{}
-					delivered, err := s.database.WasMessageDelivered(ctx, account.TelegramUserID, messageID)
+					delivered, err := s.database.WasMessageDelivered(ctx, account.ID, messageID)
 					if err != nil {
 						return nil, "", err
 					}
@@ -213,6 +214,9 @@ func (s *Service) GetMessageSummary(ctx context.Context, account models.GoogleAc
 	params := url.Values{}
 	params.Set("format", "metadata")
 	params.Add("metadataHeaders", "From")
+	params.Add("metadataHeaders", "To")
+	params.Add("metadataHeaders", "Cc")
+	params.Add("metadataHeaders", "Delivered-To")
 	params.Add("metadataHeaders", "Subject")
 	params.Add("metadataHeaders", "Date")
 
@@ -258,6 +262,8 @@ func (s *Service) GetMessageSummary(ctx context.Context, account models.GoogleAc
 	return &models.IncomingMail{
 		GmailMessageID: gmailMessageID,
 		FromHeader:     from,
+		ToHeader:       recipientHeader(headers),
+		CcHeader:       headerValue(headers, "Cc"),
 		Subject:        subject,
 		Snippet:        snippet,
 		ReceivedAt:     internalDateToTime(payload["internalDate"]),
@@ -295,6 +301,8 @@ func (s *Service) GetExpandedMessage(ctx context.Context, account models.GoogleA
 	return models.ExpandedMail{
 		GmailMessageID: gmailMessageID,
 		FromHeader:     from,
+		ToHeader:       recipientHeader(headers),
+		CcHeader:       headerValue(headers, "Cc"),
 		Subject:        subject,
 		ReceivedAt:     internalDateToTime(payload["internalDate"]),
 		BodyText:       bodyText,
@@ -354,9 +362,9 @@ func (s *Service) doAuthorized(ctx context.Context, method, rawURL string, param
 
 func (s *Service) ensureValidAccessToken(ctx context.Context, account models.GoogleAccount) (models.GoogleAccount, error) {
 	if store, ok := s.database.(interface {
-		GetGoogleAccount(context.Context, int64) (*models.GoogleAccount, error)
+		GetGoogleAccountByID(context.Context, int64) (*models.GoogleAccount, error)
 	}); ok {
-		current, err := store.GetGoogleAccount(ctx, account.TelegramUserID)
+		current, err := store.GetGoogleAccountByID(ctx, account.ID)
 		if err != nil {
 			return models.GoogleAccount{}, err
 		}
@@ -387,13 +395,13 @@ func (s *Service) forceRefresh(ctx context.Context, account models.GoogleAccount
 	}); ok {
 		storeErr = guarded.UpdateTokensGuarded(ctx, account, tokens.AccessToken, tokens.ExpiresAt, &refreshToken)
 	} else {
-		storeErr = s.database.UpdateTokens(ctx, account.TelegramUserID, tokens.AccessToken, tokens.ExpiresAt, &refreshToken)
+		storeErr = s.database.UpdateTokens(ctx, account.ID, tokens.AccessToken, tokens.ExpiresAt, &refreshToken)
 	}
 	if errors.Is(storeErr, database.ErrStaleAuthorization) {
 		if store, ok := s.database.(interface {
-			GetGoogleAccount(context.Context, int64) (*models.GoogleAccount, error)
+			GetGoogleAccountByID(context.Context, int64) (*models.GoogleAccount, error)
 		}); ok {
-			current, err := store.GetGoogleAccount(ctx, account.TelegramUserID)
+			current, err := store.GetGoogleAccountByID(ctx, account.ID)
 			if err != nil {
 				return models.GoogleAccount{}, err
 			}
@@ -476,6 +484,15 @@ func headerValue(headers []map[string]any, name string) string {
 		return ""
 	}
 	return ""
+}
+
+// recipientHeader returns the visible To header, falling back to
+// Delivered-To so Bcc'd or list mail still shows which address received it.
+func recipientHeader(headers []map[string]any) string {
+	if to := strings.TrimSpace(headerValue(headers, "To")); to != "" {
+		return to
+	}
+	return strings.TrimSpace(headerValue(headers, "Delivered-To"))
 }
 
 func internalDateToTime(value any) time.Time {

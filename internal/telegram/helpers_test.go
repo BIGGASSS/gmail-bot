@@ -1,6 +1,10 @@
 package telegram
 
-import "testing"
+import (
+	"strings"
+	"testing"
+	"unicode/utf16"
+)
 
 func TestParseExpandCallbackDataSupportsOptionalPage(t *testing.T) {
 	id, page := ParseExpandCallbackData("expand:gmail-message-1")
@@ -53,5 +57,54 @@ func TestParseReloginReminderDelayDays(t *testing.T) {
 	}
 	if ParseReloginReminderDelayDays("days nope") != nil {
 		t.Fatal("expected nil for days nope")
+	}
+}
+
+func TestLogoutCallbackDataRoundTrip(t *testing.T) {
+	for _, accountID := range []int64{LogoutAllAccounts, 17} {
+		user, got, ok := ParseLogoutCallbackData(BuildLogoutCallbackData(123456789, accountID))
+		if !ok || user != 123456789 || got != accountID {
+			t.Fatalf("account %d: user=%d got=%d ok=%v", accountID, user, got, ok)
+		}
+	}
+	for _, bad := range []string{"logout:", "logout:1", "logout:x:all", "logout:1:-3", "logout:1:0", "logout:1:abc", "expand:1:all"} {
+		if _, _, ok := ParseLogoutCallbackData(bad); ok {
+			t.Fatalf("parsed malformed data %q", bad)
+		}
+	}
+}
+
+func TestSplitMessageText(t *testing.T) {
+	if chunks := SplitMessageText("short", 10); len(chunks) != 1 || chunks[0] != "short" {
+		t.Fatalf("chunks=%q", chunks)
+	}
+	chunks := SplitMessageText("aaaa\nbbbb\ncccc", 9)
+	if strings.Join(chunks, "|") != "aaaa\nbbbb|cccc" {
+		t.Fatalf("line split=%q", chunks)
+	}
+	// A single over-long line is split without breaking a surrogate pair.
+	chunks = SplitMessageText("ab😀cd", 3)
+	if strings.Join(chunks, "|") != "ab|😀c|d" {
+		t.Fatalf("long line split=%q", chunks)
+	}
+	for _, chunk := range SplitMessageText(strings.Repeat("x\n", 5000), TelegramTextLimit) {
+		if len(utf16.Encode([]rune(chunk))) > TelegramTextLimit {
+			t.Fatalf("chunk too long: %d", len(chunk))
+		}
+	}
+}
+
+func TestLogoutPageCallbackDataRoundTrip(t *testing.T) {
+	user, page, ok := ParseLogoutPageCallbackData(BuildLogoutPageCallbackData(123456789, 4))
+	if !ok || user != 123456789 || page != 4 {
+		t.Fatalf("user=%d page=%d ok=%v", user, page, ok)
+	}
+	for _, bad := range []string{"logoutpage:", "logoutpage:1", "logoutpage:x:1", "logoutpage:1:-1", "logout:1:2"} {
+		if _, _, ok := ParseLogoutPageCallbackData(bad); ok {
+			t.Fatalf("parsed malformed data %q", bad)
+		}
+	}
+	if _, _, ok := ParseLogoutCallbackData(BuildLogoutPageCallbackData(1, 2)); ok {
+		t.Fatal("page data parsed as a logout button")
 	}
 }

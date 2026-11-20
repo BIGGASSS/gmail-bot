@@ -15,6 +15,9 @@ import (
 // auth_versions is retained after account deletion so a generation is not reused.
 var ErrStaleAuthorization = errors.New("Authorization changed or link expired. Please request a new /login link.")
 
+// ErrAccountAlreadyConnected means the Telegram user has already connected this Gmail address.
+var ErrAccountAlreadyConnected = errors.New("This Gmail account is already connected.")
+
 // StoreOAuthAttempt records the latest login link and supersedes callbacks that already consumed an older state.
 func (d *Database) StoreOAuthAttempt(ctx context.Context, state string, user int64, expires time.Time) error {
 	tx, err := d.db.BeginTx(ctx, nil)
@@ -44,7 +47,8 @@ func (d *Database) StoreOAuthAttempt(ctx context.Context, state string, user int
 	return tx.Commit()
 }
 
-// CompleteOAuth writes credentials only when state is still the latest unexpired attempt for its generation.
+// CompleteOAuth adds the account only when state is still the latest unexpired attempt for its generation.
+// It never replaces an address the user has already connected; that returns ErrAccountAlreadyConnected.
 func (d *Database) CompleteOAuth(ctx context.Context, state models.OAuthState, p UpsertGoogleAccountParams) error {
 	if p.TelegramUserID != state.TelegramUserID {
 		return ErrStaleAuthorization
@@ -68,7 +72,15 @@ func (d *Database) CompleteOAuth(ctx context.Context, state models.OAuthState, p
 	if strings.TrimSpace(p.RefreshToken) == "" {
 		return errors.New("Google did not return a refresh token. Please retry with consent.")
 	}
-	if err = upsertAccount(ctx, tx, p); err != nil {
+	var exists int
+	err = tx.QueryRowContext(ctx, `SELECT 1 FROM google_accounts WHERE telegram_user_id = ? AND lower(gmail_email) = lower(?)`, p.TelegramUserID, strings.TrimSpace(p.GmailEmail)).Scan(&exists)
+	if err == nil {
+		return ErrAccountAlreadyConnected
+	}
+	if err != sql.ErrNoRows {
+		return err
+	}
+	if _, err = upsertAccount(ctx, tx, p); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -76,7 +88,7 @@ func (d *Database) CompleteOAuth(ctx context.Context, state models.OAuthState, p
 
 // UpdateTokensGuarded stores a refresh only when the row is still the snapshot that requested it.
 func (d *Database) UpdateTokensGuarded(ctx context.Context, a models.GoogleAccount, access string, expiry time.Time, refresh *string) error {
-	result, err := d.db.ExecContext(ctx, `UPDATE google_accounts SET access_token = ?, refresh_token = COALESCE(?, refresh_token), token_expiry = ?, updated_at = ? WHERE telegram_user_id = ? AND generation = ? AND access_token = ? AND refresh_token = ?`, access, refresh, ToISO8601(expiry), ToISO8601(UTCNow()), a.TelegramUserID, a.Generation, a.AccessToken, a.RefreshToken)
+	result, err := d.db.ExecContext(ctx, `UPDATE google_accounts SET access_token = ?, refresh_token = COALESCE(?, refresh_token), token_expiry = ?, updated_at = ? WHERE id = ? AND generation = ? AND access_token = ? AND refresh_token = ?`, access, refresh, ToISO8601(expiry), ToISO8601(UTCNow()), a.ID, a.Generation, a.AccessToken, a.RefreshToken)
 	if err != nil {
 		return err
 	}
@@ -96,8 +108,8 @@ func (d *Database) UpdateTokensGuarded(ctx context.Context, a models.GoogleAccou
 func (d *Database) DeleteGoogleAccountGuarded(ctx context.Context, a models.GoogleAccount) (bool, error) {
 	result, err := d.db.ExecContext(ctx, `
 DELETE FROM google_accounts
-WHERE telegram_user_id = ? AND generation = ? AND refresh_token = ? AND access_token = ?
-`, a.TelegramUserID, a.Generation, a.RefreshToken, a.AccessToken)
+WHERE id = ? AND generation = ? AND refresh_token = ? AND access_token = ?
+`, a.ID, a.Generation, a.RefreshToken, a.AccessToken)
 	if err != nil {
 		return false, err
 	}
@@ -105,33 +117,60 @@ WHERE telegram_user_id = ? AND generation = ? AND refresh_token = ? AND access_t
 	return n == 1, err
 }
 
-// Logout atomically invalidates in-flight login callbacks and removes local credentials.
-func (d *Database) Logout(ctx context.Context, user int64) (*models.GoogleAccount, error) {
+// LogoutAll atomically invalidates in-flight login callbacks and removes every
+// account the user has connected. It returns the removed accounts so their tokens
+// can be revoked.
+func (d *Database) LogoutAll(ctx context.Context, user int64) ([]models.GoogleAccount, error) {
+	return d.logout(ctx, user, nil)
+}
+
+// LogoutAccount atomically invalidates in-flight login callbacks and removes one
+// of the user's accounts. It returns nil when the user has no such account.
+func (d *Database) LogoutAccount(ctx context.Context, user, accountID int64) (*models.GoogleAccount, error) {
+	removed, err := d.logout(ctx, user, &accountID)
+	if err != nil || len(removed) == 0 {
+		return nil, err
+	}
+	return &removed[0], nil
+}
+
+func (d *Database) logout(ctx context.Context, user int64, accountID *int64) ([]models.GoogleAccount, error) {
 	tx, err := d.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback()
-	var refresh, email string
-	err = tx.QueryRowContext(ctx, `SELECT refresh_token, gmail_email FROM google_accounts WHERE telegram_user_id = ?`, user).Scan(&refresh, &email)
-	if err != nil && err != sql.ErrNoRows {
+	rows, err := tx.QueryContext(ctx, `SELECT id, refresh_token, gmail_email FROM google_accounts WHERE telegram_user_id = ? AND (? IS NULL OR id = ?) ORDER BY id`, user, accountID, accountID)
+	if err != nil {
 		return nil, err
 	}
-	exists := err == nil
+	var removed []models.GoogleAccount
+	for rows.Next() {
+		account := models.GoogleAccount{TelegramUserID: user}
+		if err := rows.Scan(&account.ID, &account.RefreshToken, &account.GmailEmail); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		removed = append(removed, account)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	// A logout always supersedes pending login links, so a callback already in
+	// flight cannot reconnect an account the user just removed.
 	if _, err = tx.ExecContext(ctx, `INSERT INTO auth_versions (telegram_user_id, generation) VALUES (?, 1) ON CONFLICT(telegram_user_id) DO UPDATE SET generation = generation + 1, attempt = ''`, user); err != nil {
 		return nil, err
 	}
 	if _, err = tx.ExecContext(ctx, `DELETE FROM oauth_states WHERE telegram_user_id = ?`, user); err != nil {
 		return nil, err
 	}
-	if _, err = tx.ExecContext(ctx, `DELETE FROM google_accounts WHERE telegram_user_id = ?`, user); err != nil {
-		return nil, err
+	for _, account := range removed {
+		if _, err = tx.ExecContext(ctx, `DELETE FROM google_accounts WHERE id = ?`, account.ID); err != nil {
+			return nil, err
+		}
 	}
 	if err = tx.Commit(); err != nil {
 		return nil, err
 	}
-	if !exists {
-		return nil, nil
-	}
-	return &models.GoogleAccount{TelegramUserID: user, GmailEmail: email, RefreshToken: refresh}, nil
+	return removed, nil
 }

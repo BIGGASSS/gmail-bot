@@ -13,7 +13,7 @@ func TestRelogCommandAsksForLogoutThenLogin(t *testing.T) {
 	ctx := context.Background()
 	db := openTelegramTestDB(t)
 	now := database.UTCNow()
-	if err := db.UpsertGoogleAccount(ctx, database.UpsertGoogleAccountParams{
+	if _, err := db.UpsertGoogleAccount(ctx, database.UpsertGoogleAccountParams{
 		TelegramUserID: 1,
 		GmailEmail:     "user@example.com",
 		AccessToken:    "access",
@@ -43,7 +43,7 @@ func TestRelogCommandAsksForLogoutThenLogin(t *testing.T) {
 	if err != nil || state == nil {
 		t.Fatal("relog consumed or invalidated the existing login link")
 	}
-	account, err := db.GetGoogleAccount(ctx, 1)
+	account, err := userAccount(ctx, db, 1)
 	if err != nil || account == nil || account.AccessToken != "access" || account.LastHistoryID != "123" {
 		t.Fatal("relog changed the connected account")
 	}
@@ -56,7 +56,7 @@ func TestStaleInvalidGrantKeepsReplacementLogin(t *testing.T) {
 	ctx := context.Background()
 	db := openTelegramTestDB(t)
 	now := database.UTCNow()
-	if err := db.UpsertGoogleAccount(ctx, database.UpsertGoogleAccountParams{
+	if _, err := db.UpsertGoogleAccount(ctx, database.UpsertGoogleAccountParams{
 		TelegramUserID: 1,
 		GmailEmail:     "old@example.com",
 		AccessToken:    "old",
@@ -67,11 +67,11 @@ func TestStaleInvalidGrantKeepsReplacementLogin(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	old, err := db.GetGoogleAccount(ctx, 1)
+	old, err := userAccount(ctx, db, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Logout(ctx, 1); err != nil {
+	if _, err := db.LogoutAll(ctx, 1); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.StoreOAuthAttempt(ctx, "login", 1, now.Add(time.Minute)); err != nil {
@@ -92,7 +92,11 @@ func TestStaleInvalidGrantKeepsReplacementLogin(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.MarkMessageDelivered(ctx, 1, "msg", 1, 9); err != nil {
+	replacement, err := userAccount(ctx, db, 1)
+	if err != nil || replacement == nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkMessageDelivered(ctx, replacement.ID, "msg", 1, 9); err != nil {
 		t.Fatal(err)
 	}
 
@@ -102,17 +106,17 @@ func TestStaleInvalidGrantKeepsReplacementLogin(t *testing.T) {
 	if len(notifier.reloginRequests) != 0 {
 		t.Fatal("stale invalid_grant notified the user")
 	}
-	account, err := db.GetGoogleAccount(ctx, 1)
+	account, err := userAccount(ctx, db, 1)
 	if err != nil || account == nil || account.AccessToken != "new" || account.GmailEmail != "new@example.com" {
 		t.Fatalf("replacement removed: %+v %v", account, err)
 	}
-	delivered, err := db.WasMessageDelivered(ctx, 1, "msg")
+	delivered, err := db.WasMessageDelivered(ctx, replacement.ID, "msg")
 	if err != nil || !delivered {
 		t.Fatalf("delivery records removed: %v %v", delivered, err)
 	}
 
 	poller.HandleInvalidGrant(ctx, *account, nil)
-	account, err = db.GetGoogleAccount(ctx, 1)
+	account, err = userAccount(ctx, db, 1)
 	if err != nil || account != nil || len(notifier.reloginRequests) != 1 {
 		t.Fatal("current invalid_grant was not applied")
 	}

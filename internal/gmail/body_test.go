@@ -291,8 +291,7 @@ func TestExtractBodyAndAttachmentsRejectsHTMLResourceLimit(t *testing.T) {
 		part map[string]any
 	}{
 		{"HTML only", html},
-		{"plain before HTML", multipart("multipart/alternative", textPart("text/plain", "Clean plain body"), html)},
-		{"plain after HTML", multipart("multipart/alternative", html, textPart("text/plain", "Clean plain body"))},
+		{"no usable alternative", multipart("multipart/alternative", textPart("text/plain", " "), html)},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			attachment := textPart("application/pdf", "PDF data")
@@ -304,6 +303,39 @@ func TestExtractBodyAndAttachmentsRejectsHTMLResourceLimit(t *testing.T) {
 			}
 			if body != "" || len(attachments) != 0 {
 				t.Fatalf("error returned partial results: body %q, attachments %+v", body, attachments)
+			}
+		})
+	}
+}
+
+func TestExtractBodyAndAttachmentsSkipsUnconvertibleAlternative(t *testing.T) {
+	html := textPart("text/html", strings.Repeat("<div>", 20000)+"Deep body"+strings.Repeat("</div>", 20000))
+	image := textPart("image/png", "PNG data")
+	image["filename"] = "inline.png"
+	related := multipart("multipart/related", image, html)
+	signature := "--\nThe Example Team"
+	for _, tt := range []struct {
+		name, want string
+		part       map[string]any
+	}{
+		{"plain before HTML", "Clean plain body", multipart("multipart/alternative", textPart("text/plain", "Clean plain body"), html)},
+		{"plain after HTML", "Clean plain body", multipart("multipart/alternative", html, textPart("text/plain", "Clean plain body"))},
+		{"signature-only plain", signature, multipart("multipart/alternative", textPart("text/plain", signature), html)},
+		{"failed related HTML", "Clean plain body", multipart("multipart/alternative", textPart("text/plain", "Clean plain body"), related)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			attachment := textPart("application/pdf", "PDF data")
+			attachment["filename"] = "report.pdf"
+			payload := multipart("multipart/mixed", textPart("text/plain", "Intro"), attachment, tt.part)
+			body, attachments, err := ExtractBodyAndAttachments(payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if body != "Intro\n\n"+tt.want {
+				t.Fatalf("got body %q", body)
+			}
+			if len(attachments) != 1 || attachments[0].Filename != "report.pdf" {
+				t.Fatalf("unexpected attachment metadata: %+v", attachments)
 			}
 		})
 	}

@@ -113,7 +113,7 @@ func TestDatabaseTracksDeliveredMessages(t *testing.T) {
 	defer db.Close()
 
 	now := UTCNow()
-	if err := db.UpsertGoogleAccount(ctx, UpsertGoogleAccountParams{
+	accountID, err := db.UpsertGoogleAccount(ctx, UpsertGoogleAccountParams{
 		TelegramUserID:         321,
 		GmailEmail:             "user@example.com",
 		AccessToken:            "access-token",
@@ -123,14 +123,15 @@ func TestDatabaseTracksDeliveredMessages(t *testing.T) {
 		ConnectedAt:            now,
 		ReloginPromptEnabled:   true,
 		ReloginPromptDelayDays: models.DefaultReloginPromptDelayDays,
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("upsert account: %v", err)
 	}
 
-	if err := db.MarkMessageDelivered(ctx, 321, "gmail-message-1", 321, 10); err != nil {
+	if err := db.MarkMessageDelivered(ctx, accountID, "gmail-message-1", 321, 10); err != nil {
 		t.Fatalf("mark delivered: %v", err)
 	}
-	delivered, err := db.WasMessageDelivered(ctx, 321, "gmail-message-1")
+	delivered, err := db.WasMessageDelivered(ctx, accountID, "gmail-message-1")
 	if err != nil {
 		t.Fatalf("was delivered: %v", err)
 	}
@@ -145,7 +146,7 @@ func TestDatabaseTracksManualReloginPromptSchedule(t *testing.T) {
 	defer db.Close()
 
 	connectedAt := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
-	if err := db.UpsertGoogleAccount(ctx, UpsertGoogleAccountParams{
+	if _, err := db.UpsertGoogleAccount(ctx, UpsertGoogleAccountParams{
 		TelegramUserID:         654,
 		GmailEmail:             "user@example.com",
 		AccessToken:            "access-token",
@@ -159,7 +160,7 @@ func TestDatabaseTracksManualReloginPromptSchedule(t *testing.T) {
 		t.Fatalf("upsert account: %v", err)
 	}
 
-	account, err := db.GetGoogleAccount(ctx, 654)
+	account, err := userAccount(ctx, db, 654)
 	if err != nil {
 		t.Fatalf("get account: %v", err)
 	}
@@ -186,7 +187,7 @@ func TestDatabaseTracksManualReloginPromptSchedule(t *testing.T) {
 	if err := db.SetReloginPromptEnabled(ctx, 654, false); err != nil {
 		t.Fatalf("disable prompt: %v", err)
 	}
-	account, err = db.GetGoogleAccount(ctx, 654)
+	account, err = userAccount(ctx, db, 654)
 	if err != nil {
 		t.Fatalf("reload account: %v", err)
 	}
@@ -204,7 +205,7 @@ func TestDatabaseTracksManualReloginPromptSchedule(t *testing.T) {
 	if err := db.SetReloginPromptDelayDays(ctx, 654, 3); err != nil {
 		t.Fatalf("set delay: %v", err)
 	}
-	account, err = db.GetGoogleAccount(ctx, 654)
+	account, err = userAccount(ctx, db, 654)
 	if err != nil {
 		t.Fatalf("reload after delay: %v", err)
 	}
@@ -224,10 +225,10 @@ func TestDatabaseTracksManualReloginPromptSchedule(t *testing.T) {
 	}
 
 	sentAt := connectedAt.Add(3*24*time.Hour + time.Minute)
-	if err := db.MarkReloginPromptSent(ctx, 654, &sentAt); err != nil {
+	if err := db.MarkReloginPromptSent(ctx, account.ID, &sentAt); err != nil {
 		t.Fatalf("mark sent: %v", err)
 	}
-	account, err = db.GetGoogleAccount(ctx, 654)
+	account, err = userAccount(ctx, db, 654)
 	if err != nil {
 		t.Fatalf("reload after sent: %v", err)
 	}
@@ -306,7 +307,7 @@ INSERT INTO delivered_messages (
 		t.Fatalf("initialize migration: %v", err)
 	}
 
-	account, err := db.GetGoogleAccount(ctx, 99)
+	account, err := userAccount(ctx, db, 99)
 	if err != nil {
 		t.Fatalf("get migrated account: %v", err)
 	}
@@ -332,7 +333,7 @@ INSERT INTO delivered_messages (
 	if prefs.ReloginPromptDelayDays != models.DefaultReloginPromptDelayDays {
 		t.Fatalf("unexpected pref delay: %d", prefs.ReloginPromptDelayDays)
 	}
-	delivered, err := db.WasMessageDelivered(ctx, 99, "msg-1")
+	delivered, err := db.WasMessageDelivered(ctx, account.ID, "msg-1")
 	if err != nil {
 		t.Fatalf("delivery check: %v", err)
 	}

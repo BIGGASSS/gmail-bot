@@ -62,7 +62,9 @@ func (c *Client) BuildAuthorizationURL(state string) string {
 	query.Set("scope", GmailScope)
 	query.Set("access_type", "offline")
 	query.Set("include_granted_scopes", "true")
-	query.Set("prompt", "consent")
+	// select_account shows Google's account chooser so a user can connect more than
+	// the account their browser is signed in to; consent guarantees a refresh token.
+	query.Set("prompt", "consent select_account")
 	query.Set("state", state)
 	return GoogleAuthURL + "?" + query.Encode()
 }

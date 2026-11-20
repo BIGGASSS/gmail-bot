@@ -148,3 +148,33 @@ func TestChunkTextPerformance(t *testing.T) {
 		}
 	}
 }
+
+func TestFormatMailShowsRecipients(t *testing.T) {
+	received := time.Date(2026, 4, 8, 12, 0, 0, 0, time.UTC)
+	notification := FormatMailNotification(models.IncomingMail{
+		FromHeader: "sender@example.com",
+		ToHeader:   "Alex <alex@example.com>",
+		CcHeader:   "team@example.com",
+		Subject:    "Hello",
+		ReceivedAt: received,
+	})
+	if !strings.Contains(notification, "From: sender@example.com\nTo: Alex <alex@example.com>\nCc: team@example.com\nSubject: Hello") {
+		t.Fatalf("notification missing recipient lines:\n%s", notification)
+	}
+	expanded := FormatExpandedMail(models.ExpandedMail{
+		FromHeader: "sender@example.com",
+		ToHeader:   "alex@example.com",
+		Subject:    "Hello",
+		ReceivedAt: received,
+		BodyText:   "Body",
+	})
+	if !strings.Contains(expanded, "From: sender@example.com\nTo: alex@example.com\nSubject: Hello") {
+		t.Fatalf("expanded mail missing To line:\n%s", expanded)
+	}
+	if strings.Contains(expanded, "Cc:") {
+		t.Fatalf("expanded mail shows empty Cc line:\n%s", expanded)
+	}
+	if got := FormatMailNotification(models.IncomingMail{}); !strings.Contains(got, "To: Unknown recipient") {
+		t.Fatalf("missing recipient fallback:\n%s", got)
+	}
+}

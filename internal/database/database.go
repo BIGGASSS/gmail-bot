@@ -111,8 +111,45 @@ CREATE TABLE IF NOT EXISTS oauth_states (
     expires_at TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS google_accounts (
+%s
+CREATE TABLE IF NOT EXISTS relogin_prompt_preferences (
     telegram_user_id INTEGER PRIMARY KEY,
+    relogin_prompt_enabled INTEGER NOT NULL DEFAULT 1,
+    relogin_prompt_delay_days INTEGER NOT NULL DEFAULT %d,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+%s
+`, googleAccountsDDL("google_accounts"), models.DefaultReloginPromptDelayDays, deliveredMessagesDDL("delivered_messages", "google_accounts"))
+
+	if _, err := d.db.ExecContext(ctx, schema); err != nil {
+		return fmt.Errorf("create schema: %w", err)
+	}
+	if err := d.ensureGoogleAccountReloginPromptColumns(ctx); err != nil {
+		return err
+	}
+	if err := d.migrateToMultiAccount(ctx); err != nil {
+		return err
+	}
+	if _, err := d.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS delivered_messages_telegram_message ON delivered_messages (telegram_chat_id, telegram_message_id)`); err != nil {
+		return fmt.Errorf("create delivered_messages index: %w", err)
+	}
+	if err := d.backfillGoogleAccountReloginPromptDueAt(ctx); err != nil {
+		return err
+	}
+	if err := d.backfillReloginPromptPreferences(ctx); err != nil {
+		return err
+	}
+	return nil
+}
+
+// googleAccountsDDL defines one row per connected Gmail mailbox. A Telegram user
+// may connect several mailboxes, but each address only once.
+func googleAccountsDDL(table string) string {
+	return fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    telegram_user_id INTEGER NOT NULL,
     gmail_email TEXT NOT NULL,
     access_token TEXT NOT NULL,
     refresh_token TEXT NOT NULL,
@@ -125,47 +162,88 @@ CREATE TABLE IF NOT EXISTS google_accounts (
     relogin_prompt_due_at TEXT,
     relogin_prompt_sent_at TEXT,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
+    updated_at TEXT NOT NULL,
+    generation INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (telegram_user_id, gmail_email)
+);`, table, models.DefaultReloginPromptDelayDays)
+}
 
-CREATE TABLE IF NOT EXISTS relogin_prompt_preferences (
-    telegram_user_id INTEGER PRIMARY KEY,
-    relogin_prompt_enabled INTEGER NOT NULL DEFAULT 1,
-    relogin_prompt_delay_days INTEGER NOT NULL DEFAULT %d,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS delivered_messages (
-    telegram_user_id INTEGER NOT NULL,
+// deliveredMessagesDDL keys deliveries by account because Gmail message IDs are
+// only unique within one mailbox.
+func deliveredMessagesDDL(table, accountsTable string) string {
+	return fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+    account_id INTEGER NOT NULL,
     gmail_message_id TEXT NOT NULL,
     telegram_chat_id INTEGER NOT NULL,
     telegram_message_id INTEGER NOT NULL,
     delivered_at TEXT NOT NULL,
-    PRIMARY KEY (telegram_user_id, gmail_message_id),
-    FOREIGN KEY (telegram_user_id) REFERENCES google_accounts (telegram_user_id) ON DELETE CASCADE
-);
-`, models.DefaultReloginPromptDelayDays, models.DefaultReloginPromptDelayDays)
-
-	if _, err := d.db.ExecContext(ctx, schema); err != nil {
-		return fmt.Errorf("create schema: %w", err)
-	}
-	if err := d.ensureGoogleAccountReloginPromptColumns(ctx); err != nil {
-		return err
-	}
-	if err := d.backfillGoogleAccountReloginPromptDueAt(ctx); err != nil {
-		return err
-	}
-	if err := d.backfillReloginPromptPreferences(ctx); err != nil {
-		return err
-	}
-	return nil
+    PRIMARY KEY (account_id, gmail_message_id),
+    FOREIGN KEY (account_id) REFERENCES %s (id) ON DELETE CASCADE
+);`, table, accountsTable)
 }
 
-func (d *Database) ensureGoogleAccountReloginPromptColumns(ctx context.Context) error {
-	rows, err := d.db.QueryContext(ctx, `PRAGMA table_info(google_accounts)`)
+// migrateToMultiAccount rebuilds single-account tables, which were keyed by
+// telegram_user_id, into the multi-account layout. Existing rows keep their data;
+// each delivery is attached to its user's only account.
+func (d *Database) migrateToMultiAccount(ctx context.Context) error {
+	columns, err := d.tableColumns(ctx, "google_accounts")
 	if err != nil {
-		return fmt.Errorf("inspect google_accounts columns: %w", err)
+		return err
+	}
+	if _, ok := columns["id"]; ok {
+		return nil
+	}
+
+	// Foreign keys must be off while tables are swapped; the pragma is ignored inside a transaction.
+	if _, err := d.db.ExecContext(ctx, `PRAGMA foreign_keys=OFF`); err != nil {
+		return fmt.Errorf("disable foreign keys for migration: %w", err)
+	}
+	defer func() { _, _ = d.db.ExecContext(context.Background(), `PRAGMA foreign_keys=ON`) }()
+
+	tx, err := d.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	const accountColumnsCopy = `telegram_user_id, gmail_email, access_token, refresh_token, token_expiry,
+    last_history_id, connected_at, relogin_prompt_enabled, relogin_prompt_delay_days,
+    relogin_prompt_base_at, relogin_prompt_due_at, relogin_prompt_sent_at, created_at, updated_at, generation`
+	statements := []string{
+		googleAccountsDDL("google_accounts_v2"),
+		`INSERT INTO google_accounts_v2 (` + accountColumnsCopy + `) SELECT ` + accountColumnsCopy + ` FROM google_accounts ORDER BY telegram_user_id`,
+		deliveredMessagesDDL("delivered_messages_v2", "google_accounts_v2"),
+		`INSERT INTO delivered_messages_v2 (account_id, gmail_message_id, telegram_chat_id, telegram_message_id, delivered_at)
+SELECT a.id, m.gmail_message_id, m.telegram_chat_id, m.telegram_message_id, m.delivered_at
+FROM delivered_messages m JOIN google_accounts_v2 a ON a.telegram_user_id = m.telegram_user_id`,
+		`DROP TABLE delivered_messages`,
+		`DROP TABLE google_accounts`,
+		`ALTER TABLE google_accounts_v2 RENAME TO google_accounts`,
+		`ALTER TABLE delivered_messages_v2 RENAME TO delivered_messages`,
+	}
+	for _, stmt := range statements {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("migrate to multi-account schema: %w", err)
+		}
+	}
+	rows, err := tx.QueryContext(ctx, `PRAGMA foreign_key_check`)
+	if err != nil {
+		return fmt.Errorf("check foreign keys after migration: %w", err)
+	}
+	violation := rows.Next()
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if violation {
+		return errors.New("migrate to multi-account schema: foreign key violation")
+	}
+	return tx.Commit()
+}
+
+func (d *Database) tableColumns(ctx context.Context, table string) (map[string]struct{}, error) {
+	rows, err := d.db.QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
+	if err != nil {
+		return nil, fmt.Errorf("inspect %s columns: %w", table, err)
 	}
 	defer rows.Close()
 
@@ -176,11 +254,16 @@ func (d *Database) ensureGoogleAccountReloginPromptColumns(ctx context.Context) 
 		var notnull, pk int
 		var dflt sql.NullString
 		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
-			return fmt.Errorf("scan table info: %w", err)
+			return nil, fmt.Errorf("scan table info: %w", err)
 		}
 		existing[name] = struct{}{}
 	}
-	if err := rows.Err(); err != nil {
+	return existing, rows.Err()
+}
+
+func (d *Database) ensureGoogleAccountReloginPromptColumns(ctx context.Context) error {
+	existing, err := d.tableColumns(ctx, "google_accounts")
+	if err != nil {
 		return err
 	}
 
@@ -209,7 +292,7 @@ func (d *Database) ensureGoogleAccountReloginPromptColumns(ctx context.Context) 
 func (d *Database) backfillGoogleAccountReloginPromptDueAt(ctx context.Context) error {
 	rows, err := d.db.QueryContext(ctx, `
 SELECT
-    telegram_user_id,
+    id,
     connected_at,
     relogin_prompt_delay_days,
     relogin_prompt_base_at,
@@ -286,9 +369,9 @@ SET
     relogin_prompt_base_at = COALESCE(relogin_prompt_base_at, ?),
     relogin_prompt_due_at = COALESCE(relogin_prompt_due_at, ?),
     updated_at = ?
-WHERE telegram_user_id = ?
+WHERE id = ?
 `, ToISO8601(item.baseAt), ToISO8601(item.dueAt), now, item.userID); err != nil {
-			return fmt.Errorf("backfill relogin schedule for %d: %w", item.userID, err)
+			return fmt.Errorf("backfill relogin schedule for account %d: %w", item.userID, err)
 		}
 	}
 	return nil
@@ -443,21 +526,25 @@ type UpsertGoogleAccountParams struct {
 	ReloginPromptDueAt     *time.Time
 }
 
-func (d *Database) UpsertGoogleAccount(ctx context.Context, params UpsertGoogleAccountParams) error {
+// UpsertGoogleAccount inserts an account, or replaces the credentials of the
+// same address for the same Telegram user, and returns the account ID.
+func (d *Database) UpsertGoogleAccount(ctx context.Context, params UpsertGoogleAccountParams) (int64, error) {
 	tx, err := d.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer tx.Rollback()
-	if err := upsertAccount(ctx, tx, params); err != nil {
-		return err
+	id, err := upsertAccount(ctx, tx, params)
+	if err != nil {
+		return 0, err
 	}
-	return tx.Commit()
+	return id, tx.Commit()
 }
 
-func upsertAccount(ctx context.Context, tx *sql.Tx, params UpsertGoogleAccountParams) error {
+func upsertAccount(ctx context.Context, tx *sql.Tx, params UpsertGoogleAccountParams) (int64, error) {
+	// Each write takes a fresh value from the user's counter, so account generations are never reused.
 	if _, err := tx.ExecContext(ctx, `INSERT INTO auth_versions (telegram_user_id, generation) VALUES (?, 1) ON CONFLICT(telegram_user_id) DO UPDATE SET generation = generation + 1`, params.TelegramUserID); err != nil {
-		return err
+		return 0, err
 	}
 	if params.ReloginPromptDelayDays == 0 {
 		params.ReloginPromptDelayDays = models.DefaultReloginPromptDelayDays
@@ -472,7 +559,8 @@ func upsertAccount(ctx context.Context, tx *sql.Tx, params UpsertGoogleAccountPa
 	}
 	now := ToISO8601(UTCNow())
 
-	_, err := tx.ExecContext(ctx, `
+	var id int64
+	err := tx.QueryRowContext(ctx, `
 INSERT INTO google_accounts (
     telegram_user_id,
     gmail_email,
@@ -491,9 +579,8 @@ INSERT INTO google_accounts (
     generation
 )
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (SELECT generation FROM auth_versions WHERE telegram_user_id = ?))
-ON CONFLICT(telegram_user_id) DO UPDATE SET
+ON CONFLICT(telegram_user_id, gmail_email) DO UPDATE SET
     generation = excluded.generation,
-    gmail_email = excluded.gmail_email,
     access_token = excluded.access_token,
     refresh_token = excluded.refresh_token,
     token_expiry = excluded.token_expiry,
@@ -505,6 +592,7 @@ ON CONFLICT(telegram_user_id) DO UPDATE SET
     relogin_prompt_due_at = excluded.relogin_prompt_due_at,
     relogin_prompt_sent_at = excluded.relogin_prompt_sent_at,
     updated_at = excluded.updated_at
+RETURNING id
 `,
 		params.TelegramUserID,
 		params.GmailEmail,
@@ -521,13 +609,12 @@ ON CONFLICT(telegram_user_id) DO UPDATE SET
 		now,
 		now,
 		params.TelegramUserID,
-	)
-	return err
+	).Scan(&id)
+	return id, err
 }
 
-func (d *Database) GetGoogleAccount(ctx context.Context, telegramUserID int64) (*models.GoogleAccount, error) {
-	row := d.db.QueryRowContext(ctx, `
-SELECT
+const accountColumns = `
+    id,
     telegram_user_id,
     gmail_email,
     access_token,
@@ -540,10 +627,11 @@ SELECT
     relogin_prompt_base_at,
     relogin_prompt_due_at,
     relogin_prompt_sent_at,
-    generation
-FROM google_accounts
-WHERE telegram_user_id = ?
-`, telegramUserID)
+    generation`
+
+// GetGoogleAccountByID returns the account with the given ID, or nil if it no longer exists.
+func (d *Database) GetGoogleAccountByID(ctx context.Context, accountID int64) (*models.GoogleAccount, error) {
+	row := d.db.QueryRowContext(ctx, `SELECT`+accountColumns+` FROM google_accounts WHERE id = ?`, accountID)
 	account, err := scanAccount(row)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -551,25 +639,17 @@ WHERE telegram_user_id = ?
 	return account, err
 }
 
+// ListGoogleAccountsForUser returns a Telegram user's accounts in the order they were connected.
+func (d *Database) ListGoogleAccountsForUser(ctx context.Context, telegramUserID int64) ([]models.GoogleAccount, error) {
+	return d.listAccounts(ctx, `SELECT`+accountColumns+` FROM google_accounts WHERE telegram_user_id = ? ORDER BY id ASC`, telegramUserID)
+}
+
 func (d *Database) ListGoogleAccounts(ctx context.Context) ([]models.GoogleAccount, error) {
-	rows, err := d.db.QueryContext(ctx, `
-SELECT
-    telegram_user_id,
-    gmail_email,
-    access_token,
-    refresh_token,
-    token_expiry,
-    last_history_id,
-    connected_at,
-    relogin_prompt_enabled,
-    relogin_prompt_delay_days,
-    relogin_prompt_base_at,
-    relogin_prompt_due_at,
-    relogin_prompt_sent_at,
-    generation
-FROM google_accounts
-ORDER BY telegram_user_id ASC
-`)
+	return d.listAccounts(ctx, `SELECT`+accountColumns+` FROM google_accounts ORDER BY telegram_user_id ASC, id ASC`)
+}
+
+func (d *Database) listAccounts(ctx context.Context, query string, args ...any) ([]models.GoogleAccount, error) {
+	rows, err := d.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -586,30 +666,21 @@ ORDER BY telegram_user_id ASC
 	return accounts, rows.Err()
 }
 
-func (d *Database) UpdateTokens(ctx context.Context, telegramUserID int64, accessToken string, tokenExpiry time.Time, refreshToken *string) error {
-	now := ToISO8601(UTCNow())
-	if refreshToken == nil {
-		_, err := d.db.ExecContext(ctx, `
-UPDATE google_accounts
-SET access_token = ?, token_expiry = ?, updated_at = ?
-WHERE telegram_user_id = ?
-`, accessToken, ToISO8601(tokenExpiry), now, telegramUserID)
-		return err
-	}
+func (d *Database) UpdateTokens(ctx context.Context, accountID int64, accessToken string, tokenExpiry time.Time, refreshToken *string) error {
 	_, err := d.db.ExecContext(ctx, `
 UPDATE google_accounts
-SET access_token = ?, refresh_token = ?, token_expiry = ?, updated_at = ?
-WHERE telegram_user_id = ?
-`, accessToken, *refreshToken, ToISO8601(tokenExpiry), now, telegramUserID)
+SET access_token = ?, refresh_token = COALESCE(?, refresh_token), token_expiry = ?, updated_at = ?
+WHERE id = ?
+`, accessToken, refreshToken, ToISO8601(tokenExpiry), ToISO8601(UTCNow()), accountID)
 	return err
 }
 
-func (d *Database) UpdateLastHistoryID(ctx context.Context, telegramUserID int64, lastHistoryID string) error {
+func (d *Database) UpdateLastHistoryID(ctx context.Context, accountID int64, lastHistoryID string) error {
 	_, err := d.db.ExecContext(ctx, `
 UPDATE google_accounts
 SET last_history_id = ?, updated_at = ?
-WHERE telegram_user_id = ?
-`, lastHistoryID, ToISO8601(UTCNow()), telegramUserID)
+WHERE id = ?
+`, lastHistoryID, ToISO8601(UTCNow()), accountID)
 	return err
 }
 
@@ -638,7 +709,7 @@ WHERE telegram_user_id = ?
 	}, nil
 }
 
-func (d *Database) MarkReloginPromptSent(ctx context.Context, telegramUserID int64, sentAt *time.Time) error {
+func (d *Database) MarkReloginPromptSent(ctx context.Context, accountID int64, sentAt *time.Time) error {
 	value := UTCNow()
 	if sentAt != nil {
 		value = *sentAt
@@ -646,8 +717,8 @@ func (d *Database) MarkReloginPromptSent(ctx context.Context, telegramUserID int
 	_, err := d.db.ExecContext(ctx, `
 UPDATE google_accounts
 SET relogin_prompt_sent_at = ?, updated_at = ?
-WHERE telegram_user_id = ?
-`, ToISO8601(value), ToISO8601(UTCNow()), telegramUserID)
+WHERE id = ?
+`, ToISO8601(value), ToISO8601(UTCNow()), accountID)
 	return err
 }
 
@@ -680,34 +751,49 @@ func (d *Database) SetReloginPromptDelayDays(ctx context.Context, user int64, da
 	if _, err = tx.ExecContext(ctx, `INSERT INTO relogin_prompt_preferences (telegram_user_id, relogin_prompt_delay_days, created_at, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(telegram_user_id) DO UPDATE SET relogin_prompt_delay_days = excluded.relogin_prompt_delay_days, updated_at = excluded.updated_at`, user, days, now, now); err != nil {
 		return err
 	}
-	var rawBase string
-	err = tx.QueryRowContext(ctx, `SELECT COALESCE(relogin_prompt_base_at, connected_at) FROM google_accounts WHERE telegram_user_id = ?`, user).Scan(&rawBase)
-	if err != nil && err != sql.ErrNoRows {
+	type schedule struct {
+		id   int64
+		base string
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT id, COALESCE(relogin_prompt_base_at, connected_at) FROM google_accounts WHERE telegram_user_id = ?`, user)
+	if err != nil {
 		return err
 	}
-	if err == nil {
-		base, err := FromISO8601(rawBase)
+	var schedules []schedule
+	for rows.Next() {
+		var item schedule
+		if err := rows.Scan(&item.id, &item.base); err != nil {
+			rows.Close()
+			return err
+		}
+		schedules = append(schedules, item)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, item := range schedules {
+		base, err := FromISO8601(item.base)
 		if err != nil {
 			return err
 		}
-		if _, err = tx.ExecContext(ctx, `UPDATE google_accounts SET relogin_prompt_delay_days = ?, relogin_prompt_base_at = ?, relogin_prompt_due_at = ?, relogin_prompt_sent_at = NULL, updated_at = ? WHERE telegram_user_id = ?`, days, rawBase, ToISO8601(base.Add(time.Duration(days)*24*time.Hour)), now, user); err != nil {
+		if _, err = tx.ExecContext(ctx, `UPDATE google_accounts SET relogin_prompt_delay_days = ?, relogin_prompt_base_at = ?, relogin_prompt_due_at = ?, relogin_prompt_sent_at = NULL, updated_at = ? WHERE id = ?`, days, item.base, ToISO8601(base.Add(time.Duration(days)*24*time.Hour)), now, item.id); err != nil {
 			return err
 		}
 	}
 	return tx.Commit()
 }
 
-func (d *Database) DeleteGoogleAccount(ctx context.Context, telegramUserID int64) error {
-	_, err := d.db.ExecContext(ctx, `DELETE FROM google_accounts WHERE telegram_user_id = ?`, telegramUserID)
+func (d *Database) DeleteGoogleAccount(ctx context.Context, accountID int64) error {
+	_, err := d.db.ExecContext(ctx, `DELETE FROM google_accounts WHERE id = ?`, accountID)
 	return err
 }
 
-func (d *Database) WasMessageDelivered(ctx context.Context, telegramUserID int64, gmailMessageID string) (bool, error) {
+func (d *Database) WasMessageDelivered(ctx context.Context, accountID int64, gmailMessageID string) (bool, error) {
 	row := d.db.QueryRowContext(ctx, `
 SELECT 1
 FROM delivered_messages
-WHERE telegram_user_id = ? AND gmail_message_id = ?
-`, telegramUserID, gmailMessageID)
+WHERE account_id = ? AND gmail_message_id = ?
+`, accountID, gmailMessageID)
 	var one int
 	if err := row.Scan(&one); err != nil {
 		if err == sql.ErrNoRows {
@@ -718,18 +804,46 @@ WHERE telegram_user_id = ? AND gmail_message_id = ?
 	return true, nil
 }
 
-func (d *Database) MarkMessageDelivered(ctx context.Context, telegramUserID int64, gmailMessageID string, telegramChatID int64, telegramMessageID int) error {
+func (d *Database) MarkMessageDelivered(ctx context.Context, accountID int64, gmailMessageID string, telegramChatID int64, telegramMessageID int) error {
 	_, err := d.db.ExecContext(ctx, `
 INSERT OR IGNORE INTO delivered_messages (
-    telegram_user_id,
+    account_id,
     gmail_message_id,
     telegram_chat_id,
     telegram_message_id,
     delivered_at
 )
 VALUES (?, ?, ?, ?, ?)
-`, telegramUserID, gmailMessageID, telegramChatID, telegramMessageID, ToISO8601(UTCNow()))
+`, accountID, gmailMessageID, telegramChatID, telegramMessageID, ToISO8601(UTCNow()))
 	return err
+}
+
+// GetDeliveredMessageAccount returns the account whose notification is the given
+// Telegram message, along with the Gmail message ID it announced. It returns a nil
+// account when the message is unknown or its account has been disconnected.
+func (d *Database) GetDeliveredMessageAccount(ctx context.Context, telegramChatID int64, telegramMessageID int) (*models.GoogleAccount, string, error) {
+	var (
+		accountID      int64
+		gmailMessageID string
+	)
+	err := d.db.QueryRowContext(ctx, `
+SELECT account_id, gmail_message_id
+FROM delivered_messages
+WHERE telegram_chat_id = ? AND telegram_message_id = ?
+ORDER BY delivered_at DESC
+LIMIT 1
+`, telegramChatID, telegramMessageID).Scan(&accountID, &gmailMessageID)
+	if err == sql.ErrNoRows {
+		return nil, "", nil
+	}
+	if err != nil {
+		return nil, "", err
+	}
+	account, err := d.GetGoogleAccountByID(ctx, accountID)
+	if err != nil || account == nil {
+		return nil, "", err
+	}
+	return account, gmailMessageID, nil
 }
 
 type scannable interface {
@@ -738,6 +852,7 @@ type scannable interface {
 
 func scanAccount(row scannable) (*models.GoogleAccount, error) {
 	var (
+		id               int64
 		userID           int64
 		email            string
 		accessToken      string
@@ -753,6 +868,7 @@ func scanAccount(row scannable) (*models.GoogleAccount, error) {
 		generation       int64
 	)
 	if err := row.Scan(
+		&id,
 		&userID,
 		&email,
 		&accessToken,
@@ -780,6 +896,7 @@ func scanAccount(row scannable) (*models.GoogleAccount, error) {
 	}
 
 	account := &models.GoogleAccount{
+		ID:                     id,
 		Generation:             generation,
 		TelegramUserID:         userID,
 		GmailEmail:             email,

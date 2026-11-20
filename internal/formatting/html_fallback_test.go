@@ -20,7 +20,7 @@ func TestHTMLFlattenPreservesLinks(t *testing.T) {
 			{"hidden", `<div hidden><a href="https://example.com">Secret</a></div>`, "", ""},
 			{"invisible empty", `<a style="visibility:hidden" href="https://example.com"></a>`, "", ""},
 			{"visibility override", `<a style="visibility:hidden" href="https://example.com">Secret<b style="visibility:visible">Label</b></a>`, "Label", "https://example.com"},
-			{"foreign nested", `<svg><a href="https://example.com">Outer<a href="https://other.example">Inner</a></a></svg>`, "OuterInner", "https://example.com"},
+			{"nested", `<a href="https://example.com">Outer<button><a href="https://other.example">Inner</a></button></a>`, "OuterInner", "https://example.com"},
 		} {
 			t.Run(wrapper.name+"/"+tt.name, func(t *testing.T) {
 				input := wrapper.open + tt.input + wrapper.close
