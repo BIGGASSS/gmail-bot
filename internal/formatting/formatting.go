@@ -164,7 +164,8 @@ func StripHTML(value string) (string, error) {
 }
 
 // HTMLToTelegramText converts email HTML to text with safe link tokens.
-// Sources over 2 MiB or 4096 '<' delimiters return ErrHTMLResourceLimit.
+// Sources over 2 MiB or 4096 '<' delimiters, or nesting more than 512 open
+// elements, return ErrHTMLResourceLimit.
 // Parsing failures return an error, never a partial or fallback body.
 func HTMLToTelegramText(value string) (string, error) {
 	return extractHTMLText(value, true)
@@ -187,6 +188,10 @@ func extractHTMLText(value string, preserveAnchorTextLinks bool) (string, error)
 	filtered = neutralizeHTMLFormattingTags(filtered)
 	doc, err := nethtml.ParseWithOptions(strings.NewReader(filtered), nethtml.ParseOptionEnableScripting(false))
 	if err != nil {
+		// x/net/html rejects more than 512 open elements with an unexported error.
+		if strings.Contains(err.Error(), "open stack of elements exceeds") {
+			return "", ErrHTMLResourceLimit
+		}
 		return "", fmt.Errorf("parse email HTML: %w", err)
 	}
 	w := htmlTextWriter{links: preserveAnchorTextLinks}

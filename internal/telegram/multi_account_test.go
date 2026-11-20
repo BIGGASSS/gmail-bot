@@ -142,6 +142,25 @@ func TestLogoutWithSeveralAccountsShowsPicker(t *testing.T) {
 	}
 }
 
+func TestLogoutPickerSentPrivatelyFromGroup(t *testing.T) {
+	ctx := context.Background()
+	db := openTelegramTestDB(t)
+	seedAccounts(t, db, 1, "a@example.com", "b@example.com")
+	api := &fakeUpdateClient{}
+	bot := newTestBot(t, api, &fakeRevoker{}, db)
+
+	bot.HandleUpdate(ctx, commandUpdate(1, -100, "/logout"))
+
+	private := api.messagesForChat(1)
+	if len(private) != 1 || !strings.Contains(private[0], "Which Gmail account") {
+		t.Fatalf("private=%v", private)
+	}
+	group := api.messagesForChat(-100)
+	if len(group) != 1 || !strings.Contains(group[0], "private message") || strings.Contains(group[0], "@example.com") {
+		t.Fatalf("group=%v", group)
+	}
+}
+
 func TestLogoutButtonDisconnectsOnlyThatAccount(t *testing.T) {
 	ctx := context.Background()
 	db := openTelegramTestDB(t)

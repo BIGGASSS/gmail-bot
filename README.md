@@ -43,7 +43,7 @@ The bot requests `https://www.googleapis.com/auth/gmail.readonly`.
 
 ## Local run
 
-Requires Go 1.19 or newer.
+Requires Go 1.26 or newer.
 
 ```bash
 cp .env.example .env
@@ -82,7 +82,7 @@ Notifications from all of your accounts arrive in the same chat. The `Expand` bu
 
 Large mail backlogs are processed across polls without advancing past unfinished history. Expanded message bodies are capped at 50,000 internal-text runes, with a truncation notice; link tokens are never cut in half. Oversized links may be shown as plain text.
 
-Expanded messages prefer clean plain text within each MIME alternative group. If the plain alternative contains leaked Outlook/HTML markup, the bot uses the HTML alternative instead, excluding comments, scripts, styles, clearly hidden content, and Outlook-only fallbacks. Paragraphs, lists, links, and preformatted indentation are preserved; empty padding and excessive blank lines are removed. Independent message sections and intentional repeated text are retained. This is a text conversion, not a browser: external stylesheets and media queries are not evaluated. If no readable HTML alternative exists, the plain text is retained rather than losing the message. HTML exceeding the source-size limits (2 MiB or 4096 tags) is never partially rendered: the bot falls back to another alternative of the same message, such as its plain text, and reports an expansion error only if none is usable.
+Expanded messages prefer clean plain text within each MIME alternative group. If the plain alternative contains leaked Outlook/HTML markup, the bot uses the HTML alternative instead, excluding comments, scripts, styles, clearly hidden content, and Outlook-only fallbacks. Paragraphs, lists, links, and preformatted indentation are preserved; empty padding and excessive blank lines are removed. Independent message sections and intentional repeated text are retained. This is a text conversion, not a browser: external stylesheets and media queries are not evaluated. If no readable HTML alternative exists, the plain text is retained rather than losing the message. HTML exceeding the source-size limits (2 MiB or 4096 tags) or nesting more than 512 open elements is never partially rendered: the bot falls back to another alternative of the same message, such as its plain text, and reports an expansion error only if none is usable.
 
 SQLite database files and existing WAL/shared-memory sidecars must allow owner-only permissions (`0600`); startup fails if these permissions cannot be enforced. Newly created database directories use `0700`. No new environment variables are required.
 

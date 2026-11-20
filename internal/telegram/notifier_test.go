@@ -200,3 +200,14 @@ func TestEditExpandedMailEditsRequestedPage(t *testing.T) {
 		t.Fatalf("page 1 should not contain Body heading: %s", edit.Text)
 	}
 }
+
+func TestBuildExpandedPageKeyboardWrapsRows(t *testing.T) {
+	keyboard := BuildExpandedPageKeyboard("id", 20)
+	rows := keyboard.InlineKeyboard
+	if len(rows) != 3 || len(rows[0]) != 8 || len(rows[2]) != 4 {
+		t.Fatalf("unexpected layout: %d rows", len(rows))
+	}
+	if last := rows[2][3]; last.Text != "20" || *last.CallbackData != "expand:id:19" {
+		t.Fatalf("unexpected last button: %+v", last)
+	}
+}

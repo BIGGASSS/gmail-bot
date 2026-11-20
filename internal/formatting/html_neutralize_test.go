@@ -1,6 +1,7 @@
 package formatting
 
 import (
+	"errors"
 	"fmt"
 	"runtime"
 	"strings"
@@ -30,7 +31,8 @@ func requireBoundedHTMLConversion(t *testing.T, input string) {
 		runtime.ReadMemStats(&before)
 		_, err := convert(input)
 		runtime.ReadMemStats(&after)
-		if err != nil {
+		// x/net/html may reject deep nesting early; that is bounded too.
+		if err != nil && !errors.Is(err, ErrHTMLResourceLimit) {
 			t.Fatal(err)
 		}
 		if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 16<<20 {

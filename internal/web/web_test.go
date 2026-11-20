@@ -17,13 +17,14 @@ import (
 )
 
 type captureNotifier struct {
-	successes []string
-	failures  []string
+	successes  []string
+	failures   []string
+	successErr error
 }
 
 func (n *captureNotifier) SendLoginSuccess(ctx context.Context, chatID int64, gmailEmail string) error {
 	n.successes = append(n.successes, gmailEmail)
-	return nil
+	return n.successErr
 }
 
 func (n *captureNotifier) SendLoginFailure(ctx context.Context, chatID int64, errorText string) error {

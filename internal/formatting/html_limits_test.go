@@ -47,7 +47,9 @@ func TestHTMLResourceLimitBeforeDOMAllocation(t *testing.T) {
 func TestHTMLParsingBudgetEdges(t *testing.T) {
 	for _, input := range []string{
 		strings.Repeat("x", maxHTMLBytes),
-		strings.Repeat("<div>", maxHTMLMarkup) + "Body", // Unclosed tags still count.
+		// Unclosed tags still count. <p> auto-closes, staying within
+		// x/net/html's 512 open-element limit.
+		strings.Repeat("<p>", maxHTMLMarkup) + "Body",
 	} {
 		if _, err := HTMLToTelegramText(input); err != nil {
 			t.Fatal(err)
@@ -71,7 +73,8 @@ func BenchmarkHTMLResourceLimit(b *testing.B) {
 }
 
 func BenchmarkHTMLMaximumNesting(b *testing.B) {
-	input := strings.Repeat("<div>", maxHTMLMarkup) + "Body"
+	// x/net/html rejects more than 512 open elements.
+	input := strings.Repeat("<div>", 500) + "Body"
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {

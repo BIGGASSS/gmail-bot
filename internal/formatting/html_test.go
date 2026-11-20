@@ -127,8 +127,9 @@ func TestHTMLVisibilityOverrides(t *testing.T) {
 }
 
 func TestHTMLDeepNesting(t *testing.T) {
-	// Remain within the pre-parse budget while exercising every render limit.
-	const depth = 500
+	// Remain within the pre-parse budget and x/net/html's 512 open-element
+	// limit while exercising every render limit.
+	const depth = 100
 	for _, tt := range []struct{ name, open, close string }{
 		{"lists", "<ul><li>x", "</li></ul>"},
 		{"wrappers", "<div>x", "</div>"},
