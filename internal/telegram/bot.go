@@ -364,12 +364,21 @@ func (b *Bot) handleLogout(ctx context.Context, message *tgbotapi.Message) {
 // keyboard buttons, however many accounts a user connects.
 const logoutPickerPageSize = 20
 
+// sendLogoutPicker sends the picker to the user's private chat, since its
+// buttons list every connected Gmail address.
 func (b *Bot) sendLogoutPicker(chatID, telegramUserID int64, accounts []models.GoogleAccount) {
 	text, markup := buildLogoutPicker(telegramUserID, accounts, 0)
-	msg := tgbotapi.NewMessage(chatID, text)
+	msg := tgbotapi.NewMessage(telegramUserID, text)
 	msg.ReplyMarkup = markup
 	if _, err := b.api.Send(msg); err != nil {
 		applog.Errorf("Failed to send logout picker: %v", err)
+		if chatID != telegramUserID {
+			b.reply(chatID, "I couldn't send you the account list in a private message. Please start a private chat with me first (send /start to me directly), then use /logout again.")
+		}
+		return
+	}
+	if chatID != telegramUserID {
+		b.reply(chatID, "I've sent you the account list in a private message.")
 	}
 }
 
